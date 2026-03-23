@@ -25,7 +25,6 @@ DEFAULT_NUM_PROMPTS = 50
 RANDOM_SEED = 42
 
 # ── Visualization ─────────────────────────────────────────────────────────
-DEFAULT_GAMMA = 0.2       # PowerNorm gamma (< 1 emphasises low values)
 DEFAULT_CMAP = "viridis"
 PRESOFTMAX_CMAP = "magma"
 MASK_THRESHOLD = -1e6     # threshold for masking causal -inf in pre-softmax
