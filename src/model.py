@@ -19,7 +19,7 @@ if len(_autocast_params) == 0:
 
     torch.is_autocast_enabled = _compat_is_autocast_enabled
 
-from src.config import MODEL_NAME, ATTN_IMPLEMENTATION
+from config import MODEL_NAME, ATTN_IMPLEMENTATION
 
 
 def load_tokenizer(model_name: str = MODEL_NAME, **kwargs):
