@@ -2,265 +2,540 @@
 Mathematical feature extraction library for attention matrices.
 
 This module provides a collection of pure mathematical functions for
-computing metrics on attention matrices, query/key tensors, and derived
-structures. All functions follow a consistent interface and are registered
-in FEATURE_REGISTRY for dynamic invocation.
+computing metrics on attention matrices, query/key tensors, weight matrices,
+and hidden states. All functions follow a consistent interface and are
+registered in FEATURE_REGISTRY for dynamic invocation.
 
 Key Design Principles:
   - Each feature function is pure and side-effect free.
-  - Functions return scalar values (float or np.nan for failures).
-  - All computations are numerically stable.
-  - Device handling is explicit (SVD on CPU for Apple Silicon compatibility).
+  - Functions return scalar floats (np.nan on failure).
+  - SVD computations are always dispatched to CPU for Apple Silicon compatibility.
+  - ctx.cache is used to memoize SVD results within a single (layer, head) call.
+  - FEATURE_REGISTRY is the single source of truth: add a function here only.
 """
 
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Tuple
 import numpy as np
 import torch
-import math
 
 
 # ==============================================================================
-# Core Feature Functions
+# Private Utility: Single SVD Entry Point
 # ==============================================================================
 
-def compute_diagonal_mass(ctx: "HeadContext", band_width: int = 5) -> float:
+def _svdvals_cpu(matrix: torch.Tensor) -> torch.Tensor:
     """
-    Calculate the fraction of attention mass concentrated in a diagonal band.
-    
-    For a causal/localized attention pattern, mass should concentrate near the
-    main diagonal. This metric measures what fraction of the total attention
-    mass falls within a band of specified width around the main diagonal.
-    
+    Compute singular values of a matrix on CPU (MPS-safe).
+
     Args:
-        ctx: HeadContext instance containing attention_map.
-        band_width: Integer width of the diagonal band (default 5).
-    
+        matrix: 2D float tensor of shape (m, n).
+
     Returns:
-        float: Fraction of attention mass in the diagonal band (0.0 to 1.0).
-              Returns np.nan if computation fails.
-    
-    Mathematical Definition:
-        diagonal_mass = sum(A[i, j] for all |i - j| <= band_width / 2) / sum(A)
-        where A is the attention map (post-softmax).
+        1D float tensor of singular values in descending order.
     """
+    m = matrix.detach().cpu().float()
     try:
-        A = ctx.attention_map  # shape: (seq_len, seq_len)
-        seq_len = A.shape[0]
-        half_width = band_width // 2
-        
-        # Create a mask for the diagonal band
-        row_idx = torch.arange(seq_len, device=A.device, dtype=torch.float32)
-        col_idx = torch.arange(seq_len, device=A.device, dtype=torch.float32)
-        row_idx = row_idx.unsqueeze(1)  # (seq_len, 1)
-        col_idx = col_idx.unsqueeze(0)  # (1, seq_len)
-        
-        band_mask = torch.abs(row_idx - col_idx) <= half_width
-        
-        # Compute mass within band
-        mass_in_band = (A * band_mask.float()).sum()
-        total_mass = A.sum()
-        
-        if total_mass > 0:
-            return float((mass_in_band / total_mass).item())
-        else:
-            return np.nan
+        return torch.linalg.svdvals(m)
+    except Exception:
+        _, s, _ = torch.svd(m)
+        return s
+
+
+def _compute_rank_metrics(matrix: torch.Tensor) -> Dict[str, float]:
+    """
+    Compute effective rank and R_95 from a 2D matrix via a single SVD call.
+
+    Effective rank is defined as exp(H(p)), where H is the Shannon entropy
+    of the normalized singular value distribution. R_95 is the minimum number
+    of singular values whose cumulative mass reaches 95% of the total.
+
+    Args:
+        matrix: 2D tensor of shape (m, n).
+
+    Returns:
+        dict with keys:
+            'effective_rank': float, exp(Shannon entropy of normalized singular values)
+            'r95':            int,   minimum k s.t. sum(s[:k]) / sum(s) >= 0.95
+    """
+    s = _svdvals_cpu(matrix)
+    total = s.sum() + 1e-12
+    probs = s / total
+
+    # Effective Rank: exp(H(p))
+    p_nz = probs[probs > 1e-12]
+    entropy = -torch.sum(p_nz * torch.log(p_nz))
+    effective_rank = float(torch.exp(entropy).item())
+
+    # R_95: smallest k such that cumulative mass >= 0.95
+    cumsum = torch.cumsum(probs, dim=0)
+    r95 = int((cumsum < 0.95).sum().item()) + 1
+
+    return {"effective_rank": effective_rank, "r95": r95}
+
+
+def _get_cached_rank(ctx: "HeadContext", key: str, matrix: torch.Tensor) -> Dict[str, float]:
+    """
+    Retrieve rank metrics from ctx.cache, computing them only once per (layer, head).
+
+    Args:
+        ctx:    HeadContext instance carrying the shared cache dict.
+        key:    Cache key string (e.g., 'rank_Q', 'rank_Wq').
+        matrix: The 2D tensor to decompose if the cache is cold.
+
+    Returns:
+        dict with 'effective_rank' and 'r95'.
+    """
+    if key not in ctx.cache:
+        ctx.cache[key] = _compute_rank_metrics(matrix)
+    return ctx.cache[key]
+
+
+# ==============================================================================
+# Section 3a — Rank of Weight Matrices (W_q, W_k, W_v)
+# ==============================================================================
+
+def compute_effective_rank_Wq(ctx: "HeadContext") -> float:
+    """Effective rank of the weight matrix W_q for this head."""
+    try:
+        return _get_cached_rank(ctx, 'rank_Wq', ctx.W_q)['effective_rank']
     except Exception as e:
-        print(f"Error in compute_diagonal_mass: {e}")
+        print(f"Error in compute_effective_rank_Wq: {e}")
         return np.nan
 
 
-def compute_q_sim_consecutive(ctx: "HeadContext") -> float:
-    """
-    Compute expected cosine similarity between consecutive query vectors.
-    
-    This metric measures temporal continuity in the query space. High values
-    indicate smooth, continuous query evolution over the sequence, while
-    low values indicate abrupt changes.
-    
-    Args:
-        ctx: HeadContext instance containing Q (query matrix).
-    
-    Returns:
-        float: Mean cosine similarity between adjacent queries.
-               Returns np.nan if computation fails.
-    
-    Mathematical Definition:
-        E[cos(q_t, q_{t+1})] = mean([cos_sim(Q[i], Q[i+1]) for i in 0..seq_len-2])
-    """
+def compute_r95_Wq(ctx: "HeadContext") -> float:
+    """R_95% of the weight matrix W_q for this head."""
     try:
-        Q = ctx.Q  # shape: (seq_len, head_dim)
-        seq_len = Q.shape[0]
-        
-        if seq_len < 2:
-            return np.nan
-        
-        # Normalize query vectors
-        Q_norm = Q / (torch.norm(Q, dim=1, keepdim=True) + 1e-8)
-        
-        # Compute cosine similarities between consecutive queries
-        sims = []
-        for i in range(seq_len - 1):
-            sim = (Q_norm[i] * Q_norm[i + 1]).sum()
-            sims.append(float(sim.item()))
-        
-        return np.mean(sims)
+        return float(_get_cached_rank(ctx, 'rank_Wq', ctx.W_q)['r95'])
     except Exception as e:
-        print(f"Error in compute_q_sim_consecutive: {e}")
+        print(f"Error in compute_r95_Wq: {e}")
         return np.nan
 
+
+def compute_effective_rank_Wk(ctx: "HeadContext") -> float:
+    """Effective rank of the weight matrix W_k for this head."""
+    try:
+        return _get_cached_rank(ctx, 'rank_Wk', ctx.W_k)['effective_rank']
+    except Exception as e:
+        print(f"Error in compute_effective_rank_Wk: {e}")
+        return np.nan
+
+
+def compute_r95_Wk(ctx: "HeadContext") -> float:
+    """R_95% of the weight matrix W_k for this head."""
+    try:
+        return float(_get_cached_rank(ctx, 'rank_Wk', ctx.W_k)['r95'])
+    except Exception as e:
+        print(f"Error in compute_r95_Wk: {e}")
+        return np.nan
+
+
+def compute_effective_rank_Wv(ctx: "HeadContext") -> float:
+    """Effective rank of the weight matrix W_v for this head."""
+    try:
+        return _get_cached_rank(ctx, 'rank_Wv', ctx.W_v)['effective_rank']
+    except Exception as e:
+        print(f"Error in compute_effective_rank_Wv: {e}")
+        return np.nan
+
+
+def compute_r95_Wv(ctx: "HeadContext") -> float:
+    """R_95% of the weight matrix W_v for this head."""
+    try:
+        return float(_get_cached_rank(ctx, 'rank_Wv', ctx.W_v)['r95'])
+    except Exception as e:
+        print(f"Error in compute_r95_Wv: {e}")
+        return np.nan
+
+
+# ==============================================================================
+# Section 3b — Rank of Hidden States H
+# ==============================================================================
+
+def compute_effective_rank_H(ctx: "HeadContext") -> float:
+    """
+    Effective rank of the input hidden state matrix H.
+
+    H has shape (seq_len, d_model) and is shared across all heads in the same
+    layer. The cache ensures the SVD is computed only once per layer.
+    """
+    try:
+        return _get_cached_rank(ctx, 'rank_H', ctx.H_input)['effective_rank']
+    except Exception as e:
+        print(f"Error in compute_effective_rank_H: {e}")
+        return np.nan
+
+
+def compute_r95_H(ctx: "HeadContext") -> float:
+    """R_95% of the input hidden state matrix H."""
+    try:
+        return float(_get_cached_rank(ctx, 'rank_H', ctx.H_input)['r95'])
+    except Exception as e:
+        print(f"Error in compute_r95_H: {e}")
+        return np.nan
+
+
+# ==============================================================================
+# Section 3c — Rank of Projected Q and K
+# ==============================================================================
 
 def compute_effective_rank_Q(ctx: "HeadContext") -> float:
     """
-    Compute the effective rank of the query matrix using Shannon entropy.
-    
-    The effective rank measures the complexity/variability of the query space.
-    High effective rank indicates diverse query patterns, while low effective
-    rank suggests redundant or aligned queries.
-    
-    Args:
-        ctx: HeadContext instance containing Q (query matrix).
-    
-    Returns:
-        float: Effective rank (Shannon entropy of normalized singular values).
-               Returns np.nan if SVD fails.
-    
+    Effective rank of the projected Query matrix Q = H @ W_q^T.
+
     Mathematical Definition:
-        singular_values = SVD(Q)[1]  (normalized)
-        p_i = s_i / sum(s)  (probability distribution)
+        s = SVD(Q),  p_i = s_i / sum(s)
         effective_rank = exp(-sum(p_i * log(p_i)))
     """
     try:
-        Q = ctx.Q  # shape: (seq_len, head_dim)
-        
-        # Move to CPU for SVD (Apple Silicon MPS doesn't support all SVD operations)
-        Q_cpu = Q.cpu()
-        
-        # Compute singular values
-        try:
-            singular_vals = torch.linalg.svdvals(Q_cpu)
-        except Exception:
-            # Fallback: use torch.svd if linalg.svdvals is not available
-            _, singular_vals, _ = torch.svd(Q_cpu)
-        
-        singular_vals = singular_vals.float()
-        
-        # Normalize to create probability distribution
-        singular_vals = singular_vals / (singular_vals.sum() + 1e-8)
-        
-        # Compute Shannon entropy: H = -sum(p * log(p))
-        # Handle zeros by adding small epsilon
-        probs = singular_vals[singular_vals > 1e-8]
-        entropy = -torch.sum(probs * torch.log(probs + 1e-8))
-        
-        return float(entropy.item())
+        return _get_cached_rank(ctx, 'rank_Q', ctx.Q)['effective_rank']
     except Exception as e:
         print(f"Error in compute_effective_rank_Q: {e}")
         return np.nan
 
 
-def compute_attention_entropy(ctx: "HeadContext") -> float:
+def compute_r95_Q(ctx: "HeadContext") -> float:
+    """R_95% of the projected Query matrix Q."""
+    try:
+        return float(_get_cached_rank(ctx, 'rank_Q', ctx.Q)['r95'])
+    except Exception as e:
+        print(f"Error in compute_r95_Q: {e}")
+        return np.nan
+
+
+def compute_effective_rank_K(ctx: "HeadContext") -> float:
+    """Effective rank of the projected Key matrix K = H @ W_k^T."""
+    try:
+        return _get_cached_rank(ctx, 'rank_K', ctx.K)['effective_rank']
+    except Exception as e:
+        print(f"Error in compute_effective_rank_K: {e}")
+        return np.nan
+
+
+def compute_r95_K(ctx: "HeadContext") -> float:
+    """R_95% of the projected Key matrix K."""
+    try:
+        return float(_get_cached_rank(ctx, 'rank_K', ctx.K)['r95'])
+    except Exception as e:
+        print(f"Error in compute_r95_K: {e}")
+        return np.nan
+
+
+# ==============================================================================
+# Section 3d — Temporal Similarity (Q and K consecutive similarity)
+# ==============================================================================
+
+def compute_q_sim_consecutive(ctx: "HeadContext") -> float:
     """
-    Compute Shannon entropy of the attention map.
-    
-    This measures the dispersion of attention across the sequence. High entropy
-    indicates uniform, dispersed attention, while low entropy indicates
-    concentrated attention on a few positions.
-    
-    Args:
-        ctx: HeadContext instance containing attention_map.
-    
-    Returns:
-        float: Shannon entropy of the attention distribution.
-               Returns np.nan if computation fails.
-    
+    Expected cosine similarity between temporally adjacent query vectors.
+
     Mathematical Definition:
-        H = -sum(A[i, j] * log(A[i, j])) for all i, j where A[i, j] > 0
-        where A is the attention map (post-softmax, already normalized).
+        E[cos(q_t, q_{t+1})] = mean(cos_sim(Q[:-1], Q[1:]))
     """
     try:
-        A = ctx.attention_map  # shape: (seq_len, seq_len)
-        
-        # Flatten and filter positive values
-        flat_attn = A.flatten()
-        positive_attn = flat_attn[flat_attn > 1e-8]
-        
-        if len(positive_attn) == 0:
+        Q = ctx.Q
+        if Q.shape[0] < 2:
             return np.nan
-        
-        # Compute Shannon entropy: H = -sum(p * log(p))
-        entropy = -torch.sum(positive_attn * torch.log(positive_attn + 1e-8))
-        
+        Q_norm = Q / (torch.norm(Q, dim=1, keepdim=True) + 1e-8)
+        sims = (Q_norm[:-1] * Q_norm[1:]).sum(dim=1)
+        return float(sims.mean().item())
+    except Exception as e:
+        print(f"Error in compute_q_sim_consecutive: {e}")
+        return np.nan
+
+
+def compute_k_sim_consecutive(ctx: "HeadContext") -> float:
+    """
+    Expected cosine similarity between temporally adjacent key vectors.
+
+    Mathematical Definition:
+        E[cos(k_t, k_{t+1})] = mean(cos_sim(K[:-1], K[1:]))
+    """
+    try:
+        K = ctx.K
+        if K.shape[0] < 2:
+            return np.nan
+        K_norm = K / (torch.norm(K, dim=1, keepdim=True) + 1e-8)
+        sims = (K_norm[:-1] * K_norm[1:]).sum(dim=1)
+        return float(sims.mean().item())
+    except Exception as e:
+        print(f"Error in compute_k_sim_consecutive: {e}")
+        return np.nan
+
+
+# ==============================================================================
+# Section 3e — SVD Alignment (H vs W_q, H vs W_k)
+# ==============================================================================
+
+def _top2_left_singular_vectors(matrix: torch.Tensor) -> torch.Tensor:
+    """
+    Return the top-2 left singular vectors of a matrix.
+
+    Args:
+        matrix: 2D tensor of shape (m, n), m >= 2.
+
+    Returns:
+        Tensor of shape (2, m) with the first two left singular vectors as rows.
+    """
+    m = matrix.detach().cpu().float()
+    try:
+        U, _, _ = torch.linalg.svd(m, full_matrices=False)
+    except Exception:
+        U, _, _ = torch.svd(m)
+    return U[:, :2].T  # shape: (2, m)
+
+
+def compute_svd_alignment_H_Wq(ctx: "HeadContext") -> float:
+    """
+    Mean cosine similarity between the top-2 left singular vectors of H and W_q.
+
+    This measures how much the principal directions of the input hidden space
+    are aligned with the principal directions of the query projection.
+
+    Mathematical Definition:
+        u1_H, u2_H = top-2 left singular vectors of H
+        u1_Wq, u2_Wq = top-2 left singular vectors of W_q
+        alignment = (cos(u1_H, u1_Wq) + cos(u2_H, u2_Wq)) / 2
+    """
+    try:
+        U_H = _top2_left_singular_vectors(ctx.H_input)   # (2, seq_len)
+        U_Wq = _top2_left_singular_vectors(ctx.W_q)      # (2, d_model or head_dim)
+
+        # Align to shorter dimension via dot product on common axis
+        # Both projected to their own spaces: use normalized dot product per pair
+        def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
+            a = a / (a.norm() + 1e-8)
+            b = b / (b.norm() + 1e-8)
+            # If dimensions differ, project to min size
+            min_d = min(a.shape[0], b.shape[0])
+            return float((a[:min_d] * b[:min_d]).sum().item())
+
+        sim1 = _cos(U_H[0], U_Wq[0])
+        sim2 = _cos(U_H[1], U_Wq[1])
+        return float(np.mean([abs(sim1), abs(sim2)]))
+    except Exception as e:
+        print(f"Error in compute_svd_alignment_H_Wq: {e}")
+        return np.nan
+
+
+def compute_svd_alignment_H_Wk(ctx: "HeadContext") -> float:
+    """
+    Mean cosine similarity between the top-2 left singular vectors of H and W_k.
+
+    Symmetric counterpart of compute_svd_alignment_H_Wq applied to the key
+    projection matrix. High values suggest that the key projection captures
+    the dominant variance directions of the input representation.
+    """
+    try:
+        U_H = _top2_left_singular_vectors(ctx.H_input)
+        U_Wk = _top2_left_singular_vectors(ctx.W_k)
+
+        def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
+            a = a / (a.norm() + 1e-8)
+            b = b / (b.norm() + 1e-8)
+            min_d = min(a.shape[0], b.shape[0])
+            return float((a[:min_d] * b[:min_d]).sum().item())
+
+        sim1 = _cos(U_H[0], U_Wk[0])
+        sim2 = _cos(U_H[1], U_Wk[1])
+        return float(np.mean([abs(sim1), abs(sim2)]))
+    except Exception as e:
+        print(f"Error in compute_svd_alignment_H_Wk: {e}")
+        return np.nan
+
+
+# ==============================================================================
+# Section 3f — RMSNorm Gamma and Channel-Wise Variance
+# ==============================================================================
+
+def compute_rmsnorm_gamma_norm(ctx: "HeadContext") -> float:
+    """
+    L2 norm of the RMSNorm gamma (scale) parameter vector.
+
+    Measures the overall magnitude of the learned channel-wise rescaling
+    applied to hidden states before the attention projection. Returns np.nan
+    if the model does not use QK-Norm or if gamma is not stored in the context.
+    """
+    try:
+        if ctx.rmsnorm_gamma is None:
+            return np.nan
+        gamma = ctx.rmsnorm_gamma.detach().cpu().float()
+        return float(torch.norm(gamma).item())
+    except Exception as e:
+        print(f"Error in compute_rmsnorm_gamma_norm: {e}")
+        return np.nan
+
+
+def compute_channel_variance_Wq(ctx: "HeadContext") -> float:
+    """
+    Variance of the column norms of W_q across output channels.
+
+    High variance indicates that certain output dimensions of W_q dominate
+    the projection, suggesting anisotropic channel structure that may produce
+    structured (non-uniform) key/query distributions.
+    """
+    try:
+        W = ctx.W_q.detach().cpu().float()
+        col_norms = torch.norm(W, dim=0)  # norm per output channel
+        return float(col_norms.var().item())
+    except Exception as e:
+        print(f"Error in compute_channel_variance_Wq: {e}")
+        return np.nan
+
+
+def compute_channel_variance_Wk(ctx: "HeadContext") -> float:
+    """
+    Variance of the column norms of W_k across output channels.
+
+    Symmetric counterpart of compute_channel_variance_Wq. Captures
+    channel-level anisotropy in the key projection.
+    """
+    try:
+        W = ctx.W_k.detach().cpu().float()
+        col_norms = torch.norm(W, dim=0)
+        return float(col_norms.var().item())
+    except Exception as e:
+        print(f"Error in compute_channel_variance_Wk: {e}")
+        return np.nan
+
+
+# ==============================================================================
+# Section 5a — Attention Map: Diagonal Pattern
+# ==============================================================================
+
+def _compute_diagonal_mass(ctx: "HeadContext", band_width: int) -> float:
+    """
+    Core implementation of diagonal mass computation.
+
+    Mathematical Definition:
+        DiagMass_w = sum(A[i,j] for |i-j| <= w//2) / sum(A)
+    """
+    A = ctx.attention_map
+    seq_len = A.shape[0]
+    half = band_width // 2
+    row = torch.arange(seq_len, device=A.device, dtype=torch.float32).unsqueeze(1)
+    col = torch.arange(seq_len, device=A.device, dtype=torch.float32).unsqueeze(0)
+    mask = (torch.abs(row - col) <= half).float()
+    total = A.sum()
+    if total <= 0:
+        return np.nan
+    return float((A * mask).sum() / total)
+
+
+def compute_diagonal_mass_1(ctx: "HeadContext") -> float:
+    """Fraction of attention mass within diagonal band of width 1 (exact diagonal)."""
+    try:
+        return _compute_diagonal_mass(ctx, band_width=1)
+    except Exception as e:
+        print(f"Error in compute_diagonal_mass_1: {e}")
+        return np.nan
+
+
+def compute_diagonal_mass_5(ctx: "HeadContext") -> float:
+    """Fraction of attention mass within diagonal band of width 5."""
+    try:
+        return _compute_diagonal_mass(ctx, band_width=5)
+    except Exception as e:
+        print(f"Error in compute_diagonal_mass_5: {e}")
+        return np.nan
+
+
+# ==============================================================================
+# Section 5b — Attention Map: Sink Mass
+# ==============================================================================
+
+def _compute_attention_sink_mass(ctx: "HeadContext", k: int) -> float:
+    """
+    Core implementation of attention sink mass.
+
+    Computes the fraction of attention absorbed by the first k tokens
+    (typical attention sinks), excluding diagonal entries.
+
+    Mathematical Definition:
+        Sink_k = mean(A[k:, :k])   (off-diagonal only, i != j)
+    """
+    A = ctx.attention_map
+    N = A.shape[0]
+    if N <= k:
+        return np.nan
+    sink_region = A[k:, :k]
+    return float(sink_region.mean().item())
+
+
+def compute_attention_sink_mass_1(ctx: "HeadContext") -> float:
+    """Attention sink mass for the first 1 token (BOS token)."""
+    try:
+        return _compute_attention_sink_mass(ctx, k=1)
+    except Exception as e:
+        print(f"Error in compute_attention_sink_mass_1: {e}")
+        return np.nan
+
+
+def compute_attention_sink_mass_4(ctx: "HeadContext") -> float:
+    """Attention sink mass for the first 4 tokens."""
+    try:
+        return _compute_attention_sink_mass(ctx, k=4)
+    except Exception as e:
+        print(f"Error in compute_attention_sink_mass_4: {e}")
+        return np.nan
+
+
+# ==============================================================================
+# Section 5c — Attention Map: Entropy and Sparsity
+# ==============================================================================
+
+def compute_attention_entropy(ctx: "HeadContext") -> float:
+    """
+    Shannon entropy of the full post-softmax attention map.
+
+    High entropy indicates dispersed (dense) attention.
+    Low entropy indicates concentrated (sparse) attention.
+
+    Mathematical Definition:
+        H = -sum_{i,j} A[i,j] * log(A[i,j])  for A[i,j] > 0
+    """
+    try:
+        A = ctx.attention_map.flatten()
+        A = A[A > 1e-12]
+        if len(A) == 0:
+            return np.nan
+        entropy = -torch.sum(A * torch.log(A))
         return float(entropy.item())
     except Exception as e:
         print(f"Error in compute_attention_entropy: {e}")
         return np.nan
 
 
-def compute_diagonal_mass_5(ctx: "HeadContext") -> float:
+def compute_attention_gini(ctx: "HeadContext") -> float:
     """
-    Compute diagonal mass within a band of width 5.
-    
-    Convenience wrapper around compute_diagonal_mass with band_width=5.
-    
-    Args:
-        ctx: HeadContext instance containing attention_map.
-    
-    Returns:
-        float: Fraction of attention mass in diagonal band of width 5.
-    """
-    return compute_diagonal_mass(ctx, band_width=5)
+    Gini coefficient of the attention weight distribution.
 
+    Measures pure inequality (sparsity), independently of position.
+    Gini = 0: perfectly uniform. Gini = 1: single-position attention.
 
-def compute_query_key_sim_mean(ctx: "HeadContext") -> float:
-    """
-    Compute mean cosine similarity between query and key vectors.
-    
-    This metric measures alignment between queries and keys in the learned
-    space. High values indicate well-aligned query-key distributions.
-    
-    Args:
-        ctx: HeadContext instance containing Q and K.
-    
-    Returns:
-        float: Mean cosine similarity between Q and K vectors over sequence.
-               Returns np.nan if computation fails.
+    Mathematical Definition:
+        G = (2 * sum(i * w_i) / (n * sum(w))) - (n+1)/n
+        where w_i are sorted in ascending order.
     """
     try:
-        Q = ctx.Q  # shape: (seq_len, head_dim)
-        K = ctx.K  # shape: (seq_len, head_dim)
-        
-        if Q.shape[0] != K.shape[0]:
-            return np.nan
-        
-        # Normalize vectors
-        Q_norm = Q / (torch.norm(Q, dim=1, keepdim=True) + 1e-8)
-        K_norm = K / (torch.norm(K, dim=1, keepdim=True) + 1e-8)
-        
-        # Compute element-wise cosine similarities
-        sims = (Q_norm * K_norm).sum(dim=1)
-        return float(sims.mean().item())
+        w, _ = torch.sort(ctx.attention_map.flatten().cpu().float())
+        n = w.shape[0]
+        idx = torch.arange(1, n + 1, dtype=torch.float32)
+        gini = (2.0 * (idx * w).sum() / (n * w.sum() + 1e-12)) - (n + 1.0) / n
+        return float(gini.item())
     except Exception as e:
-        print(f"Error in compute_query_key_sim_mean: {e}")
+        print(f"Error in compute_attention_gini: {e}")
         return np.nan
 
 
 def compute_max_attention_weight(ctx: "HeadContext") -> float:
     """
-    Compute the maximum single attention weight.
-    
-    This measures the concentration of attention at a single position.
-    High values (closer to 1.0) indicate peaky attention, while low values
-    indicate more diffuse attention patterns.
-    
-    Args:
-        ctx: HeadContext instance containing attention_map.
-    
-    Returns:
-        float: Maximum value in the attention map.
+    Maximum single attention weight in the map (Peakiness).
+
+    Values near 1.0 indicate highly concentrated, spike-like attention.
     """
     try:
-        A = ctx.attention_map
-        return float(A.max().item())
+        return float(ctx.attention_map.max().item())
     except Exception as e:
         print(f"Error in compute_max_attention_weight: {e}")
         return np.nan
@@ -268,62 +543,86 @@ def compute_max_attention_weight(ctx: "HeadContext") -> float:
 
 def compute_attention_variance_per_query(ctx: "HeadContext") -> float:
     """
-    Compute mean variance of attention weights across queries.
-    
-    For each query position, compute the variance of its attention distribution
-    across all key positions. High variance means selective attention, while
-    low variance means uniform attention patterns.
-    
-    Args:
-        ctx: HeadContext instance containing attention_map.
-    
-    Returns:
-        float: Mean variance across all query positions.
-               Returns np.nan if computation fails.
+    Mean variance of each query row in the attention map.
+
+    High values indicate selective attention per query position.
+    Low values suggest diffuse or uniform attention rows.
     """
     try:
-        A = ctx.attention_map  # shape: (seq_len, seq_len)
-        
-        # Compute variance for each query (row)
-        variances = torch.var(A, dim=1)
-        return float(variances.mean().item())
+        return float(torch.var(ctx.attention_map, dim=1).mean().item())
     except Exception as e:
         print(f"Error in compute_attention_variance_per_query: {e}")
         return np.nan
 
 
-def compute_rank_attention_matrix(ctx: "HeadContext") -> float:
+def compute_query_key_sim_mean(ctx: "HeadContext") -> float:
     """
-    Compute the effective rank of the attention matrix.
-    
-    Uses singular value decomposition to estimate the intrinsic dimensionality
-    of the attention map. Lower rank indicates redundancy/structure.
-    
-    Args:
-        ctx: HeadContext instance containing attention_map.
-    
-    Returns:
-        float: Effective rank (number of significant singular values).
-               Returns np.nan if computation fails.
+    Mean element-wise cosine similarity between Q and K vectors.
+
+    Measures average geometric alignment between queries and keys,
+    independent of their dot-product magnitudes.
     """
     try:
-        A = ctx.attention_map.cpu()
-        
-        # Compute singular values
-        try:
-            singular_vals = torch.linalg.svdvals(A)
-        except Exception:
-            _, singular_vals, _ = torch.svd(A)
-        
-        singular_vals = singular_vals.float()
-        
-        # Count how many singular values are significant (> 1% of max)
-        threshold = 0.01 * singular_vals.max()
-        effective_rank = (singular_vals > threshold).sum().float()
-        
-        return float(effective_rank.item())
+        Q, K = ctx.Q, ctx.K
+        if Q.shape[0] != K.shape[0]:
+            return np.nan
+        Q_norm = Q / (torch.norm(Q, dim=1, keepdim=True) + 1e-8)
+        K_norm = K / (torch.norm(K, dim=1, keepdim=True) + 1e-8)
+        return float((Q_norm * K_norm).sum(dim=1).mean().item())
     except Exception as e:
-        print(f"Error in compute_rank_attention_matrix: {e}")
+        print(f"Error in compute_query_key_sim_mean: {e}")
+        return np.nan
+
+
+# ==============================================================================
+# Section 5d — Attention Map: Structural / Positional Metrics
+# ==============================================================================
+
+def compute_attention_center_of_mass(ctx: "HeadContext") -> float:
+    """
+    Normalized look-back distance (attention center of mass).
+
+    For each query position i, computes the attention-weighted mean of the
+    relative position j/i of attended keys, then averages over the sequence.
+    Values near 1.0 indicate local attention; values near 0.0 indicate
+    global or sink-style attention.
+
+    Mathematical Definition:
+        CenterMass = (1/N) * sum_i sum_j (j/i) * A[i,j]
+    """
+    try:
+        A = ctx.attention_map
+        N = A.shape[0]
+        if N < 2:
+            return np.nan
+        row = torch.arange(1, N + 1, dtype=torch.float32, device=A.device).unsqueeze(1)
+        col = torch.arange(1, N + 1, dtype=torch.float32, device=A.device).unsqueeze(0)
+        weights = col / row.clamp(min=1e-8)
+        return float((A * weights).sum() / N)
+    except Exception as e:
+        print(f"Error in compute_attention_center_of_mass: {e}")
+        return np.nan
+
+
+# ==============================================================================
+# Section 5e — Attention Map: Rank
+# ==============================================================================
+
+def compute_effective_rank_A(ctx: "HeadContext") -> float:
+    """Effective rank of the post-softmax attention matrix A."""
+    try:
+        return _get_cached_rank(ctx, 'rank_A', ctx.attention_map)['effective_rank']
+    except Exception as e:
+        print(f"Error in compute_effective_rank_A: {e}")
+        return np.nan
+
+
+def compute_r95_A(ctx: "HeadContext") -> float:
+    """R_95% of the post-softmax attention matrix A."""
+    try:
+        return float(_get_cached_rank(ctx, 'rank_A', ctx.attention_map)['r95'])
+    except Exception as e:
+        print(f"Error in compute_r95_A: {e}")
         return np.nan
 
 
@@ -332,36 +631,84 @@ def compute_rank_attention_matrix(ctx: "HeadContext") -> float:
 # ==============================================================================
 
 FEATURE_REGISTRY: Dict[str, Callable] = {
-    "diagonal_mass_5": compute_diagonal_mass_5,
-    "q_sim_consecutive": compute_q_sim_consecutive,
-    "effective_rank_Q": compute_effective_rank_Q,
-    "attention_entropy": compute_attention_entropy,
-    "query_key_sim_mean": compute_query_key_sim_mean,
-    "max_attention_weight": compute_max_attention_weight,
+
+    # --- Weight Matrix Ranks (W_q, W_k, W_v) ---
+    "effective_rank_Wq":            compute_effective_rank_Wq,
+    "r95_Wq":                       compute_r95_Wq,
+    "effective_rank_Wk":            compute_effective_rank_Wk,
+    "r95_Wk":                       compute_r95_Wk,
+    "effective_rank_Wv":            compute_effective_rank_Wv,
+    "r95_Wv":                       compute_r95_Wv,
+
+    # --- Hidden State Rank (H) ---
+    "effective_rank_H":             compute_effective_rank_H,
+    "r95_H":                        compute_r95_H,
+
+    # --- Projected Q and K Ranks ---
+    "effective_rank_Q":             compute_effective_rank_Q,
+    "r95_Q":                        compute_r95_Q,
+    "effective_rank_K":             compute_effective_rank_K,
+    "r95_K":                        compute_r95_K,
+
+    # --- Temporal Similarity ---
+    "q_sim_consecutive":            compute_q_sim_consecutive,
+    "k_sim_consecutive":            compute_k_sim_consecutive,
+
+    # --- SVD Alignment (H vs projections) ---
+    "svd_alignment_H_Wq":          compute_svd_alignment_H_Wq,
+    "svd_alignment_H_Wk":          compute_svd_alignment_H_Wk,
+
+    # --- RMSNorm and Channel Structure ---
+    "rmsnorm_gamma_norm":           compute_rmsnorm_gamma_norm,
+    "channel_variance_Wq":          compute_channel_variance_Wq,
+    "channel_variance_Wk":          compute_channel_variance_Wk,
+
+    # --- Attention Map: Diagonal ---
+    "diagonal_mass_1":              compute_diagonal_mass_1,
+    "diagonal_mass_5":              compute_diagonal_mass_5,
+
+    # --- Attention Map: Sink ---
+    "attention_sink_mass_1":        compute_attention_sink_mass_1,
+    "attention_sink_mass_4":        compute_attention_sink_mass_4,
+
+    # --- Attention Map: Entropy and Sparsity ---
+    "attention_entropy":            compute_attention_entropy,
+    "attention_gini":               compute_attention_gini,
+    "max_attention_weight":         compute_max_attention_weight,
     "attention_variance_per_query": compute_attention_variance_per_query,
-    "rank_attention_matrix": compute_rank_attention_matrix,
+    "query_key_sim_mean":           compute_query_key_sim_mean,
+
+    # --- Attention Map: Structural ---
+    "attention_center_of_mass":     compute_attention_center_of_mass,
+
+    # --- Attention Map: Rank ---
+    "effective_rank_A":             compute_effective_rank_A,
+    "r95_A":                        compute_r95_A,
 }
 
+
+# ==============================================================================
+# Public Entry Point
+# ==============================================================================
 
 def get_all_features(ctx: "HeadContext") -> Dict[str, float]:
     """
     Compute all registered features for a given HeadContext.
-    
-    Iterates through FEATURE_REGISTRY and computes each feature, gracefully
-    handling any failures by returning np.nan for failed features.
-    
+
+    Iterates through FEATURE_REGISTRY, runs each function with graceful
+    failure handling, and returns a flat dictionary of scalar floats.
+
     Args:
-        ctx: HeadContext instance.
-    
+        ctx: HeadContext instance for a single (layer, head) pair.
+
     Returns:
-        Dict[str, float]: Dictionary mapping feature names to their computed values.
-                         Failed features are represented as np.nan.
+        Dict[str, float]: Feature name to scalar value. np.nan on failure.
     """
-    results = {}
-    for feature_name, feature_func in FEATURE_REGISTRY.items():
+    results: Dict[str, float] = {}
+    for name, func in FEATURE_REGISTRY.items():
         try:
-            results[feature_name] = feature_func(ctx)
+            results[name] = func(ctx)
         except Exception as e:
-            print(f"Warning: Feature '{feature_name}' failed: {e}")
-            results[feature_name] = np.nan
+            print(f"Warning: feature '{name}' failed with: {e}")
+            results[name] = np.nan
     return results

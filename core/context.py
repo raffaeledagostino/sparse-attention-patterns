@@ -11,41 +11,43 @@ from dataclasses import dataclass, field
 from typing import Dict, Any, Optional
 import torch
 
+# core/context.py
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional
+import torch
 
 @dataclass
 class HeadContext:
-    """
-    Encapsulates the complete state of a single attention head.
-    
-    This dataclass holds all necessary information for feature extraction
-    from a single attention head, including model metadata, tensor references,
-    and a cache for computed metrics to avoid redundant calculations.
-    
-    Attributes:
-        model_name (str): Name of the LLM model (e.g., "Qwen/Qwen2.5-0.5B-Instruct").
-        layer_idx (int): Index of the transformer layer (0-indexed).
-        head_idx (int): Index of the attention head within the layer.
-        prompt_len (int): Sequence length of the processed prompt.
-        H_input (torch.Tensor): Hidden state input to this layer, shape (seq_len, hidden_dim).
-        W_q (torch.Tensor): Query weight projection matrix, shape (hidden_dim, hidden_dim).
-        W_k (torch.Tensor): Key weight projection matrix, shape (hidden_dim, hidden_dim).
-        Q (torch.Tensor): Query matrix (per-head), shape (seq_len, head_dim).
-        K (torch.Tensor): Key matrix (per-head), shape (seq_len, head_dim).
-        attention_map (torch.Tensor): Softmax attention weights, shape (seq_len, seq_len).
-        cache (Dict[str, Any]): Dictionary for caching computed features to avoid redundant calculations.
-    """
-    
-    model_name: str
-    layer_idx: int
-    head_idx: int
-    prompt_len: int
-    H_input: torch.Tensor
-    W_q: torch.Tensor
-    W_k: torch.Tensor
-    Q: torch.Tensor
-    K: torch.Tensor
-    attention_map: torch.Tensor
-    cache: Dict[str, Any] = field(default_factory=dict)
+    model_name:     str
+    layer_idx:      int
+    head_idx:       int
+    prompt_len:     int
+    H_input:        torch.Tensor
+    W_q:            torch.Tensor
+    W_k:            torch.Tensor
+    W_v:            torch.Tensor
+    Q:              torch.Tensor
+    K:              torch.Tensor
+    attention_map:  torch.Tensor
+    rmsnorm_gamma:  Optional[torch.Tensor] = None
+    cache:          Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        """
+        Normalize all tensors to float32 on CPU at construction time.
+        This is the single point of dtype normalization for the entire pipeline.
+        bfloat16 (Qwen3 native) and float16 are both cast to float32 here.
+        """
+        _to_f32 = lambda t: t.detach().cpu().float() if t is not None else None
+
+        self.H_input       = _to_f32(self.H_input)
+        self.W_q           = _to_f32(self.W_q)
+        self.W_k           = _to_f32(self.W_k)
+        self.W_v           = _to_f32(self.W_v)
+        self.Q             = _to_f32(self.Q)
+        self.K             = _to_f32(self.K)
+        self.attention_map = _to_f32(self.attention_map)
+        self.rmsnorm_gamma = _to_f32(self.rmsnorm_gamma)
     
     def get_head_dim(self) -> int:
         """

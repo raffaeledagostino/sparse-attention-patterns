@@ -7,15 +7,14 @@ in-memory processing on Apple Silicon.
 """
 
 from core.context import HeadContext
-from core.features_library import FEATURE_REGISTRY, compute_diagonal_mass, compute_effective_rank_Q
+from core.features_library import FEATURE_REGISTRY, get_all_features
 from core.analyzer import LightweightAttentionAnalyzer
 from core.dataset_manager import DatasetManager
 
 __all__ = [
     "HeadContext",
     "FEATURE_REGISTRY",
-    "compute_diagonal_mass",
-    "compute_effective_rank_Q",
+    "get_all_features",
     "LightweightAttentionAnalyzer",
     "DatasetManager",
 ]

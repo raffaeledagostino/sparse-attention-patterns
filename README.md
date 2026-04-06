@@ -588,10 +588,10 @@ This pipeline is designed for research on sparse attention mechanisms and RoPE (
 
 **Recommended citation format** (if you use this):
 ```bibtex
-@software{sparse_attention_analyzer_2024,
+@software{sparse_attention_analyzer_2026,
   title={Sparse Attention Analysis Pipeline},
   author={[Your Name]},
-  year={2024},
+  year={2026},
   url={https://github.com/[your_repo]}
 }
 ```
