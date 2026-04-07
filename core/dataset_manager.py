@@ -68,79 +68,99 @@ class DatasetManager:
         except Exception as e:
             raise RuntimeError(f"Failed to read dataset from {self.filepath}: {e}")
     
-    def append_records(self, records: List[Dict[str, Any]]) -> int:
-        """
-        Append new feature records to the dataset.
-        
-        Atomically loads existing data (if any), appends new records, and
-        writes back to disk. Ensures no data loss and maintains schema consistency.
-        
-        Args:
-            records (List[Dict[str, Any]]): List of feature dictionaries to append.
-        
-        Returns:
-            int: Total number of rows in the updated dataset.
-        
-        Raises:
-            ValueError: If records list is empty or records have inconsistent schemas.
-            RuntimeError: If write operation fails.
-        """
-        if not records:
-            raise ValueError("Cannot append empty records list.")
-        
-        # Convert records to dataframe
-        try:
-            new_df = pd.DataFrame(records)
-        except Exception as e:
-            raise ValueError(f"Failed to convert records to dataframe: {e}")
-        
-        # Load existing data
-        existing_df = self.read_dataset()
-        
-        if existing_df is None:
-            # No existing data; this is the first write
-            combined_df = new_df
-            print(f"[DatasetManager] Creating new dataset with {len(new_df)} records.")
+    PRIMARY_KEYS = ["model", "prompt_id", "layer", "head"]
+
+def append_records(self, records: List[Dict[str, Any]]) -> int:
+    """
+    Incrementally update the dataset with new records.
+
+    Three cases are handled transparently:
+      1. File does not exist       → create from scratch
+      2. New (model, prompt_id, layer, head) combos → append new rows
+      3. Same combos, new columns  → merge new features into existing rows
+         (existing rows get NaN for new columns until reprocessed)
+
+    Args:
+        records: List of feature dicts, each must contain the four PRIMARY_KEYS.
+
+    Returns:
+        int: Total number of rows in the updated dataset.
+    """
+    if not records:
+        raise ValueError("Cannot append empty records list.")
+
+    try:
+        df_new = pd.DataFrame(records)
+    except Exception as e:
+        raise ValueError(f"Failed to convert records to dataframe: {e}")
+
+    # Validate PRIMARY_KEYS presence
+    missing_keys = [k for k in PRIMARY_KEYS if k not in df_new.columns]
+    if missing_keys:
+        raise ValueError(f"Records missing primary key columns: {missing_keys}")
+
+    # --- Case 1: no existing dataset ---
+    existing_df = self.read_dataset()
+    if existing_df is None:
+        combined_df = df_new
+        print(f"[DatasetManager] Creating new dataset: {len(df_new)} rows, {len(df_new.columns)} cols.")
+
+    else:
+        # Build key sets for comparison
+        def _key_set(df: pd.DataFrame):
+            return set(zip(*[df[k].astype(str) for k in PRIMARY_KEYS]))
+
+        old_keys = _key_set(existing_df)
+        new_keys = _key_set(df_new)
+
+        truly_new = new_keys - old_keys    # combos not yet in dataset
+        overlap   = new_keys & old_keys    # combos already present
+
+        combined_df = existing_df.copy()
+
+        # --- Case 2: append genuinely new rows ---
+        if truly_new:
+            mask = df_new.apply(
+                lambda r: tuple(str(r[k]) for k in PRIMARY_KEYS) in truly_new,
+                axis=1
+            )
+            df_append = df_new[mask].copy()
+            # Fill missing columns from existing schema with NaN
+            for col in existing_df.columns:
+                if col not in df_append.columns:
+                    df_append[col] = np.nan
+            combined_df = pd.concat([combined_df, df_append], ignore_index=True)
+            print(f"[DatasetManager] Appended {len(df_append)} new rows.")
+
+        # --- Case 3: new feature columns for existing rows ---
+        new_feature_cols = [c for c in df_new.columns if c not in existing_df.columns]
+        if new_feature_cols and overlap:
+            cols_to_merge = PRIMARY_KEYS + new_feature_cols
+            # Cast keys to str for merge safety
+            merge_right = df_new[cols_to_merge].copy()
+            for k in PRIMARY_KEYS:
+                combined_df[k] = combined_df[k].astype(str)
+                merge_right[k] = merge_right[k].astype(str)
+            combined_df = pd.merge(combined_df, merge_right, on=PRIMARY_KEYS, how="left")
+            print(f"[DatasetManager] Added {len(new_feature_cols)} new feature columns: {new_feature_cols}")
+
+        if not truly_new and not new_feature_cols:
+            print("[DatasetManager] Warning: no new rows and no new columns detected. Nothing written.")
+            return len(combined_df)
+
+    # Write atomically
+    try:
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+        if self.format == "parquet":
+            combined_df.to_parquet(self.filepath, index=False)
         else:
-            # Validate schema compatibility
-            existing_cols = set(existing_df.columns)
-            new_cols = set(new_df.columns)
-            
-            if existing_cols != new_cols:
-                missing_in_new = existing_cols - new_cols
-                extra_in_new = new_cols - existing_cols
-                
-                if missing_in_new:
-                    print(f"[DatasetManager] Warning: New records missing columns: {missing_in_new}")
-                if extra_in_new:
-                    print(f"[DatasetManager] Warning: New records have extra columns: {extra_in_new}")
-                
-                # Align columns
-                for col in existing_cols:
-                    if col not in new_df.columns:
-                        new_df[col] = np.nan
-                
-                new_df = new_df[existing_cols]
-            
-            # Concatenate
-            combined_df = pd.concat([existing_df, new_df], ignore_index=True)
-            print(f"[DatasetManager] Appended {len(new_df)} new records. Total: {len(combined_df)} rows.")
-        
-        # Write to disk
-        try:
-            # Ensure parent directory exists
-            self.filepath.parent.mkdir(parents=True, exist_ok=True)
-            
-            if self.format == "parquet":
-                combined_df.to_parquet(self.filepath, index=False)
-            else:  # csv
-                combined_df.to_csv(self.filepath, index=False)
-            
-            print(f"[DatasetManager] Dataset written to {self.filepath}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to write dataset to {self.filepath}: {e}")
-        
-        return len(combined_df)
+            combined_df.to_csv(self.filepath, index=False)
+        print(f"[DatasetManager] Dataset written to {self.filepath}: "
+              f"{len(combined_df)} rows × {len(combined_df.columns)} cols.")
+    except Exception as e:
+        raise RuntimeError(f"Failed to write dataset to {self.filepath}: {e}")
+
+    return len(combined_df)
     
     def get_dataset_info(self) -> Optional[Dict[str, Any]]:
         """

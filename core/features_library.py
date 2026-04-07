@@ -421,62 +421,166 @@ def _compute_diagonal_mass(ctx: "HeadContext", band_width: int) -> float:
         return np.nan
     return float((A * mask).sum() / total)
 
+# ==============================================================================
+# Section 5a — Attention Map: Diagonal and Shifted Patterns
+# ==============================================================================
+
+def _compute_shifted_diagonal_mass(ctx: "HeadContext", band_width: int, shift: int = 0) -> float:
+    """
+    Core implementation of shifted diagonal mass computation.
+    
+    Args:
+        band_width: Width of the band (1 = exactly one diagonal, 3 = target diagonal +/- 1)
+        shift: Number of tokens to look back. 
+               0 = main diagonal (self-attention)
+               1 = first sub-diagonal (attention to previous token)
+               d = d-th sub-diagonal (attention to token d steps ago)
+    
+    Mathematical Definition:
+        Mass = sum(A[i,j] for |(i - j) - shift| <= w//2) / sum(A)
+    """
+    A = ctx.attention_map
+    seq_len = A.shape[0]
+    half = band_width // 2
+    
+    row = torch.arange(seq_len, device=A.device, dtype=torch.float32).unsqueeze(1)
+    col = torch.arange(seq_len, device=A.device, dtype=torch.float32).unsqueeze(0)
+    
+    # Distance is (row - col). We center the band around 'shift'
+    mask = (torch.abs((row - col) - shift) <= half).float()
+    
+    total = A.sum()
+    if total <= 0:
+        return np.nan
+    return float((A * mask).sum() / total)
+
 
 def compute_diagonal_mass_1(ctx: "HeadContext") -> float:
-    """Fraction of attention mass within diagonal band of width 1 (exact diagonal)."""
+    """Fraction of attention mass on the exact main diagonal (self-attention)."""
     try:
-        return _compute_diagonal_mass(ctx, band_width=1)
+        return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=0)
     except Exception as e:
         print(f"Error in compute_diagonal_mass_1: {e}")
         return np.nan
 
 
 def compute_diagonal_mass_5(ctx: "HeadContext") -> float:
-    """Fraction of attention mass within diagonal band of width 5."""
+    """Fraction of attention mass within a centered diagonal band of width 5."""
     try:
-        return _compute_diagonal_mass(ctx, band_width=5)
+        return _compute_shifted_diagonal_mass(ctx, band_width=5, shift=0)
     except Exception as e:
         print(f"Error in compute_diagonal_mass_5: {e}")
         return np.nan
 
 
+def compute_shifted_diagonal_mass_1_shift_1(ctx: "HeadContext") -> float:
+    """Fraction of attention mass on the exact previous token (shift=1)."""
+    try:
+        return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=1)
+    except Exception as e:
+        print(f"Error in compute_shifted_diagonal_mass_1_shift_1: {e}")
+        return np.nan
+
+
+def compute_shifted_diagonal_mass_1_shift_2(ctx: "HeadContext") -> float:
+    """Fraction of attention mass exactly 2 tokens ago (shift=2)."""
+    try:
+        return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=2)
+    except Exception as e:
+        print(f"Error in compute_shifted_diagonal_mass_1_shift_2: {e}")
+        return np.nan
+    
+def compute_shifted_diagonal_mass_1_shift_3(ctx: "HeadContext") -> float:
+    """Fraction of attention mass exactly 2 tokens ago (shift=2)."""
+    try:
+        return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=3)
+    except Exception as e:
+        print(f"Error in compute_shifted_diagonal_mass_1_shift_2: {e}")
+        return np.nan
+    
+def compute_shifted_diagonal_mass_1_shift_4(ctx: "HeadContext") -> float:
+    """Fraction of attention mass exactly 2 tokens ago (shift=2)."""
+    try:
+        return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=4)
+    except Exception as e:
+        print(f"Error in compute_shifted_diagonal_mass_1_shift_2: {e}")
+        return np.nan
+
 # ==============================================================================
 # Section 5b — Attention Map: Sink Mass
 # ==============================================================================
 
-def _compute_attention_sink_mass(ctx: "HeadContext", k: int) -> float:
-    """
-    Core implementation of attention sink mass.
+# ==============================================================================
+# Section 5b — Attention Map: Per-Token Sink Mass
+# ==============================================================================
 
-    Computes the fraction of attention absorbed by the first k tokens
-    (typical attention sinks), excluding diagonal entries.
+def _compute_single_token_sink_mass(ctx: "HeadContext", token_pos: int) -> float:
+    """
+    Core implementation of per-token sink mass.
+
+    Computes the average attention received by a single token at position
+    `token_pos`, averaged over all query positions that come strictly after it
+    (causal mask: i > token_pos only, excluding self-attention on the diagonal).
+
+    Args:
+        token_pos: Absolute position of the candidate sink token (0-indexed).
 
     Mathematical Definition:
-        Sink_k = mean(A[k:, :k])   (off-diagonal only, i != j)
+        Sink_j = mean(A[i, j] for i > j)  =  mean(A[j+1:, j])
     """
     A = ctx.attention_map
     N = A.shape[0]
-    if N <= k:
-        return np.nan
-    sink_region = A[k:, :k]
-    return float(sink_region.mean().item())
 
-
-def compute_attention_sink_mass_1(ctx: "HeadContext") -> float:
-    """Attention sink mass for the first 1 token (BOS token)."""
-    try:
-        return _compute_attention_sink_mass(ctx, k=1)
-    except Exception as e:
-        print(f"Error in compute_attention_sink_mass_1: {e}")
+    # Need at least one query position after token_pos
+    if N <= token_pos + 1:
         return np.nan
 
+    # Column j, rows strictly below the diagonal (causal queries only)
+    sink_column = A[token_pos + 1:, token_pos]  # shape: (N - token_pos - 1,)
+    return float(sink_column.mean().item())
 
-def compute_attention_sink_mass_4(ctx: "HeadContext") -> float:
-    """Attention sink mass for the first 4 tokens."""
+
+def compute_sink_mass_token_0(ctx: "HeadContext") -> float:
+    """Average attention received by token 0 (BOS) from all subsequent tokens."""
     try:
-        return _compute_attention_sink_mass(ctx, k=4)
+        return _compute_single_token_sink_mass(ctx, token_pos=0)
     except Exception as e:
-        print(f"Error in compute_attention_sink_mass_4: {e}")
+        print(f"Error in compute_sink_mass_token_0: {e}")
+        return np.nan
+
+
+def compute_sink_mass_token_1(ctx: "HeadContext") -> float:
+    """Average attention received by token 1 from all subsequent tokens."""
+    try:
+        return _compute_single_token_sink_mass(ctx, token_pos=1)
+    except Exception as e:
+        print(f"Error in compute_sink_mass_token_1: {e}")
+        return np.nan
+
+
+def compute_sink_mass_token_2(ctx: "HeadContext") -> float:
+    """Average attention received by token 2 from all subsequent tokens."""
+    try:
+        return _compute_single_token_sink_mass(ctx, token_pos=2)
+    except Exception as e:
+        print(f"Error in compute_sink_mass_token_2: {e}")
+        return np.nan
+
+
+def compute_sink_mass_token_3(ctx: "HeadContext") -> float:
+    """Average attention received by token 3 from all subsequent tokens."""
+    try:
+        return _compute_single_token_sink_mass(ctx, token_pos=3)
+    except Exception as e:
+        print(f"Error in compute_sink_mass_token_3: {e}")
+        return np.nan
+    
+def compute_sink_mass_token_4(ctx: "HeadContext") -> float:
+    """Average attention received by token 3 from all subsequent tokens."""
+    try:
+        return _compute_single_token_sink_mass(ctx, token_pos=4)
+    except Exception as e:
+        print(f"Error in compute_sink_mass_token_4 {e}")
         return np.nan
 
 
@@ -666,10 +770,17 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
     # --- Attention Map: Diagonal ---
     "diagonal_mass_1":              compute_diagonal_mass_1,
     "diagonal_mass_5":              compute_diagonal_mass_5,
+    "diagonal_mass_1_shifted_1":    compute_shifted_diagonal_mass_1_shift_1,
+    "diagonal_mass_1_shifted_2":    compute_shifted_diagonal_mass_1_shift_2,
+    "diagonal_mass_1_shifted_3":    compute_shifted_diagonal_mass_1_shift_3,
+    "diagonal_mass_1_shifted_4":    compute_shifted_diagonal_mass_1_shift_4,
 
-    # --- Attention Map: Sink ---
-    "attention_sink_mass_1":        compute_attention_sink_mass_1,
-    "attention_sink_mass_4":        compute_attention_sink_mass_4,
+    # --- Attention Map: Sink (per-token, independent) ---
+    "sink_mass_token_0":            compute_sink_mass_token_0,
+    "sink_mass_token_1":            compute_sink_mass_token_1,
+    "sink_mass_token_2":            compute_sink_mass_token_2,
+    "sink_mass_token_3":            compute_sink_mass_token_3,
+    "sink_mass_token_4":            compute_sink_mass_token_4,
 
     # --- Attention Map: Entropy and Sparsity ---
     "attention_entropy":            compute_attention_entropy,
