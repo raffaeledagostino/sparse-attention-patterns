@@ -75,9 +75,9 @@ def append_records(self, records: List[Dict[str, Any]]) -> int:
     Incrementally update the dataset with new records.
 
     Three cases are handled transparently:
-      1. File does not exist       → create from scratch
-      2. New (model, prompt_id, layer, head) combos → append new rows
-      3. Same combos, new columns  → merge new features into existing rows
+      1. File does not exist -> create from scratch
+      2. New (model, prompt_id, layer, head) combos -> append new rows
+      3. Same combos, new columns  -> merge new features into existing rows
          (existing rows get NaN for new columns until reprocessed)
 
     Args:

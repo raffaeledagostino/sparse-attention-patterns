@@ -18,9 +18,11 @@ from typing import Callable, Dict, Tuple
 import numpy as np
 import torch
 
+from core.context import HeadContext
+
 
 # ==============================================================================
-# Private Utility: Single SVD Entry Point
+# Single SVD Entry Point
 # ==============================================================================
 
 def _svdvals_cpu(matrix: torch.Tensor) -> torch.Tensor:
@@ -91,7 +93,7 @@ def _get_cached_rank(ctx: "HeadContext", key: str, matrix: torch.Tensor) -> Dict
 
 
 # ==============================================================================
-# Section 3a — Rank of Weight Matrices (W_q, W_k, W_v)
+# Rank of Weight Matrices (W_q, W_k, W_v)
 # ==============================================================================
 
 def compute_effective_rank_Wq(ctx: "HeadContext") -> float:
@@ -149,7 +151,7 @@ def compute_r95_Wv(ctx: "HeadContext") -> float:
 
 
 # ==============================================================================
-# Section 3b — Rank of Hidden States H
+# Rank of Hidden States H
 # ==============================================================================
 
 def compute_effective_rank_H(ctx: "HeadContext") -> float:
@@ -176,7 +178,7 @@ def compute_r95_H(ctx: "HeadContext") -> float:
 
 
 # ==============================================================================
-# Section 3c — Rank of Projected Q and K
+# Rank of Projected Q and K
 # ==============================================================================
 
 def compute_effective_rank_Q(ctx: "HeadContext") -> float:
@@ -222,7 +224,7 @@ def compute_r95_K(ctx: "HeadContext") -> float:
 
 
 # ==============================================================================
-# Section 3d — Temporal Similarity (Q and K consecutive similarity)
+# Temporal Similarity (Q and K consecutive similarity)
 # ==============================================================================
 
 def compute_q_sim_consecutive(ctx: "HeadContext") -> float:
@@ -264,7 +266,7 @@ def compute_k_sim_consecutive(ctx: "HeadContext") -> float:
 
 
 # ==============================================================================
-# Section 3e — SVD Alignment (H vs W_q, H vs W_k)
+# SVD Alignment (H vs W_q, H vs W_k)
 # ==============================================================================
 
 def _top2_left_singular_vectors(matrix: torch.Tensor) -> torch.Tensor:
@@ -345,7 +347,7 @@ def compute_svd_alignment_H_Wk(ctx: "HeadContext") -> float:
 
 
 # ==============================================================================
-# Section 3f — RMSNorm Gamma and Channel-Wise Variance
+# RMSNorm Gamma and Channel-Wise Variance
 # ==============================================================================
 
 def compute_rmsnorm_gamma_norm(ctx: "HeadContext") -> float:
@@ -400,7 +402,7 @@ def compute_channel_variance_Wk(ctx: "HeadContext") -> float:
 
 
 # ==============================================================================
-# Section 5a — Attention Map: Diagonal Pattern
+# Attention Map: Diagonal Pattern
 # ==============================================================================
 
 def _compute_diagonal_mass(ctx: "HeadContext", band_width: int) -> float:
@@ -422,7 +424,7 @@ def _compute_diagonal_mass(ctx: "HeadContext", band_width: int) -> float:
     return float((A * mask).sum() / total)
 
 # ==============================================================================
-# Section 5a — Attention Map: Diagonal and Shifted Patterns
+# Attention Map: Diagonal and Shifted Patterns
 # ==============================================================================
 
 def _compute_shifted_diagonal_mass(ctx: "HeadContext", band_width: int, shift: int = 0) -> float:
@@ -507,11 +509,7 @@ def compute_shifted_diagonal_mass_1_shift_4(ctx: "HeadContext") -> float:
         return np.nan
 
 # ==============================================================================
-# Section 5b — Attention Map: Sink Mass
-# ==============================================================================
-
-# ==============================================================================
-# Section 5b — Attention Map: Per-Token Sink Mass
+# Attention Map: Per-Token Sink Mass
 # ==============================================================================
 
 def _compute_single_token_sink_mass(ctx: "HeadContext", token_pos: int) -> float:
@@ -585,7 +583,7 @@ def compute_sink_mass_token_4(ctx: "HeadContext") -> float:
 
 
 # ==============================================================================
-# Section 5c — Attention Map: Entropy and Sparsity
+# Attention Map: Entropy and Sparsity
 # ==============================================================================
 
 def compute_attention_entropy(ctx: "HeadContext") -> float:
@@ -679,7 +677,7 @@ def compute_query_key_sim_mean(ctx: "HeadContext") -> float:
 
 
 # ==============================================================================
-# Section 5d — Attention Map: Structural / Positional Metrics
+# Attention Map: Structural Metrics
 # ==============================================================================
 
 def compute_attention_center_of_mass(ctx: "HeadContext") -> float:
@@ -709,7 +707,7 @@ def compute_attention_center_of_mass(ctx: "HeadContext") -> float:
 
 
 # ==============================================================================
-# Section 5e — Attention Map: Rank
+# Attention Map: Rank
 # ==============================================================================
 
 def compute_effective_rank_A(ctx: "HeadContext") -> float:
@@ -799,7 +797,7 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
 
 
 # ==============================================================================
-# Public Entry Point
+# Get All Features Function
 # ==============================================================================
 
 def get_all_features(ctx: "HeadContext") -> Dict[str, float]:
