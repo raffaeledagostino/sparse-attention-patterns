@@ -13,6 +13,10 @@ from pathlib import Path
 import pandas as pd
 import numpy as np
 
+from config import PRIMARY_KEY
+
+PRIMARY_KEYS = PRIMARY_KEY
+
 
 class DatasetManager:
     """
@@ -68,8 +72,6 @@ class DatasetManager:
         except Exception as e:
             raise RuntimeError(f"Failed to read dataset from {self.filepath}: {e}")
     
-    PRIMARY_KEYS = ["model", "prompt_id", "layer", "head"]
-
 def append_records(self, records: List[Dict[str, Any]]) -> int:
     """
     Incrementally update the dataset with new records.

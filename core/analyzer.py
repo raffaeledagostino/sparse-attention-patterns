@@ -12,11 +12,33 @@ called after each layer to prevent out-of-memory errors on Apple Silicon.
 
 from typing import List, Dict, Tuple, Optional, Any
 import gc
+import inspect
 import warnings
 import torch
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+from config import ATTN_IMPLEMENTATION
+
+
+_orig_is_autocast_enabled = torch.is_autocast_enabled
+
+
+def _compat_is_autocast_enabled(device_type=None):
+    """Compatibility wrapper for torch/transformers autocast signature mismatches."""
+    try:
+        if device_type is None:
+            return _orig_is_autocast_enabled()
+        return _orig_is_autocast_enabled(device_type)
+    except TypeError:
+        return _orig_is_autocast_enabled()
+    except RuntimeError:
+        return _orig_is_autocast_enabled()
+
+
+if torch.is_autocast_enabled is not _compat_is_autocast_enabled:
+    torch.is_autocast_enabled = _compat_is_autocast_enabled
 
 from core.context import HeadContext
 from core.features_library import get_all_features, FEATURE_REGISTRY
@@ -28,7 +50,7 @@ class LightweightAttentionAnalyzer:
     
     This class implements the complete pipeline for extracting mathematical features
     from attention heads in transformer models, with special emphasis on memory
-    efficiency for Apple Silicon (M2) through eager tensor eviction and explicit
+    efficiency for Apple Silicon through eager tensor eviction and explicit
     garbage collection.
     
     Key Features:
@@ -67,16 +89,26 @@ class LightweightAttentionAnalyzer:
         self.device = device or self._detect_device()
         
         print(f"[Analyzer] Loading model '{model_name}' on device '{self.device}'...")
-        
+        _device_map = {
+            "mps":  None,   
+            "cuda": "auto", 
+            "cpu":  "cpu",
+        }
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                torch_dtype=torch.float32,
-                device_map="auto" if self.device != "cpu" else "cpu",
+                dtype="auto",
+                device_map=_device_map[self.device],
+                trust_remote_code=True,
+                attn_implementation=ATTN_IMPLEMENTATION,
                 local_files_only=local_files_only,
             )
+            if self.device == "mps":
+                self.model = self.model.to("mps")
+
             self.tokenizer = AutoTokenizer.from_pretrained(
                 model_name,
+                trust_remote_code=True,
                 local_files_only=local_files_only,
             )
         except Exception as e:
@@ -87,6 +119,11 @@ class LightweightAttentionAnalyzer:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
         self.model.eval()
+        if hasattr(self.model, "config"):
+            if hasattr(self.model.config, "attn_implementation"):
+                self.model.config.attn_implementation = ATTN_IMPLEMENTATION
+            if hasattr(self.model.config, "_attn_implementation"):
+                self.model.config._attn_implementation = ATTN_IMPLEMENTATION
         print(f"[Analyzer] Model loaded successfully. Using {self.model.config.num_hidden_layers} layers.")
     
     @staticmethod
@@ -110,6 +147,7 @@ class LightweightAttentionAnalyzer:
         max_length: int = 128,
         layer_indices: Optional[List[int]] = None,
         head_indices: Optional[List[int]] = None,
+        prompt_source: str = "unknown",
     ) -> List[Dict[str, Any]]:
         """
         Analyze a prompt and extract features from specified attention heads.
@@ -141,7 +179,10 @@ class LightweightAttentionAnalyzer:
             truncation=True,
             max_length=max_length,
         )
-        input_ids = tokens["input_ids"].to(self.device)
+        input_ids = tokens["input_ids"]
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+        input_ids = input_ids.to(self.device)
         seq_len = input_ids.shape[1]
         
         print(f"[Analyzer] Tokenized to {seq_len} tokens.")
@@ -151,17 +192,22 @@ class LightweightAttentionAnalyzer:
         try:
             with torch.no_grad():
                 outputs = self.model(
-                    input_ids,
-                    output_attentions=True,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
+                input_ids,
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
         except Exception as e:
             raise RuntimeError(f"Forward pass failed: {e}")
         
         # Extract hidden states and attentions
         hidden_states = outputs.hidden_states  # Tuple of length num_layers + 1 (includes embedding)
         attentions = outputs.attentions  # Tuple of length num_layers
+
+        if not attentions:
+            raise RuntimeError(
+                "Forward pass did not return attention tensors. Ensure the model runs with eager attention implementation."
+            )
         
         num_layers = len(attentions)
         num_heads = attentions[0].shape[1]
@@ -196,37 +242,62 @@ class LightweightAttentionAnalyzer:
                     print(f"[Analyzer]   Could not access attention module for layer {layer_idx}. Skipping.")
                     continue
                 
-                # Extract or compute W_q and W_k
-                W_q, W_k = self._extract_weight_projections(attention_module)
-                if W_q is None or W_k is None:
-                    print(f"[Analyzer]   Could not extract weight projections for layer {layer_idx}. Skipping.")
+                # Extract projections used by feature computation
+                W_q, W_k, W_v = self._extract_weight_projections(attention_module)
+                if W_q is None or W_k is None or W_v is None:
+                    print(f"[Analyzer]   Could not extract Q/K/V projections for layer {layer_idx}. Skipping.")
                     continue
                 
-                hidden_dim = W_q.shape[0]
-                num_q_heads = attention_module.num_heads
-                num_kv_heads = getattr(attention_module, "num_key_value_heads", num_q_heads)
-                head_dim = hidden_dim // num_q_heads
-                
+                hidden_dim = W_q.shape[1]  # W_q ha shape (out, in) = (num_q_heads*head_dim, hidden_dim)
+                num_q_heads = getattr(
+                    attention_module,
+                    "num_heads",
+                    getattr(attention_module, "num_attention_heads", self.model.config.num_attention_heads),
+                )
+                num_kv_heads = getattr(
+                    attention_module,
+                    "num_key_value_heads",
+                    getattr(self.model.config, "num_key_value_heads", num_q_heads),
+                )
+                head_dim = getattr(
+                    attention_module,
+                    "head_dim",
+                    getattr(self.model.config, "head_dim", hidden_dim // num_q_heads),
+                )
+                kv_group_size = max(1, num_q_heads // max(1, num_kv_heads))
+                qk_norm_gamma = None
+                if hasattr(attention_module, "q_norm") and hasattr(attention_module.q_norm, "weight"):
+                    qk_norm_gamma = attention_module.q_norm.weight.detach()
+
+                # Pre-split projection weights per head to match HeadContext semantics.
+                W_q_heads = W_q.reshape(num_q_heads, head_dim, -1)
+                W_k_heads = W_k.reshape(num_kv_heads, head_dim, -1)
+                W_v_heads = W_v.reshape(num_kv_heads, head_dim, -1)
+
+                # Compute Q and K only once per layer, then slice by head.
+                Q_raw = H_input @ W_q.T
+                if attention_module.q_proj.bias is not None:
+                    Q_raw = Q_raw + attention_module.q_proj.bias
+                Q_all = Q_raw.reshape(seq_len, num_q_heads, head_dim)
+
+                K_raw = H_input @ W_k.T
+                if attention_module.k_proj.bias is not None:
+                    K_raw = K_raw + attention_module.k_proj.bias
+                K_all = K_raw.reshape(seq_len, num_kv_heads, head_dim)
+
                 # Get attention weights for this layer
                 layer_attentions = attentions[layer_idx]  # shape: (batch_size, num_heads, seq_len, seq_len)
                 layer_attentions = layer_attentions.squeeze(0)  # Remove batch (assuming batch_size=1)
                 
                 for head_idx in head_indices:
-                    # Compute Q and K on-the-fly
-                    Q = H_input @ W_q.T  # (seq_len, hidden_dim)
-                    Q = Q.reshape(seq_len, num_q_heads, head_dim)
-                    Q = Q[:, head_idx, :]  # Extract this head: (seq_len, head_dim)
-                    
-                    K = H_input @ W_k.T  # (seq_len, hidden_dim)
-                    K = K.reshape(seq_len, num_kv_heads, head_dim)
-                    
-                    # Handle Grouped Query Attention (GQA): replicate KV heads if needed
+                    # Handle Grouped Query Attention (GQA): map Q head to corresponding KV head.
                     if num_kv_heads < num_q_heads:
-                        kv_head_idx = head_idx % num_kv_heads
+                        kv_head_idx = min(head_idx // kv_group_size, num_kv_heads - 1)
                     else:
                         kv_head_idx = head_idx
-                    
-                    K = K[:, kv_head_idx, :]  # Extract corresponding KV head: (seq_len, head_dim)
+
+                    Q = Q_all[:, head_idx, :]        # (seq_len, head_dim)
+                    K = K_all[:, kv_head_idx, :]     # (seq_len, head_dim)
                     
                     # Get attention map for this head
                     attention_map = layer_attentions[head_idx, :, :]  # (seq_len, seq_len)
@@ -238,11 +309,13 @@ class LightweightAttentionAnalyzer:
                         head_idx=head_idx,
                         prompt_len=seq_len,
                         H_input=H_input,
-                        W_q=W_q,
-                        W_k=W_k,
+                        W_q=W_q_heads[head_idx],
+                        W_k=W_k_heads[kv_head_idx],
+                        W_v=W_v_heads[kv_head_idx],
                         Q=Q,
                         K=K,
                         attention_map=attention_map,
+                        rmsnorm_gamma=qk_norm_gamma,
                     )
                     
                     # Compute all features
@@ -254,6 +327,7 @@ class LightweightAttentionAnalyzer:
                         "layer_idx": layer_idx,
                         "head_idx": head_idx,
                         "prompt_len": seq_len,
+                        "prompt_source": prompt_source,
                     }
                     result.update(features)
                     results.append(result)
@@ -262,7 +336,7 @@ class LightweightAttentionAnalyzer:
                     del Q, K, ctx
                 
                 # Explicit layer cleanup: delete large tensors and call garbage collection
-                del H_input, W_q, W_k, layer_attentions, attention_module
+                del H_input, W_q, W_k, W_v, W_q_heads, W_k_heads, W_v_heads, Q_all, K_all, layer_attentions, attention_module
                 gc.collect()
                 if self.device == "mps":
                     torch.mps.empty_cache()
@@ -309,35 +383,46 @@ class LightweightAttentionAnalyzer:
     
     def _extract_weight_projections(
         self, attention_module: Any
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
-        Extract query and key weight projections from an attention module.
+        Extract query, key, and value weight projections from an attention module.
         
         Args:
             attention_module: The attention module (self_attn).
         
         Returns:
-            Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]: (W_q, W_k) weight matrices,
-                                                                    or (None, None) if extraction fails.
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+                (W_q, W_k, W_v) weight matrices, or (None, None, None) if extraction fails.
         
         Notes:
-            W_q and W_k have shape (hidden_dim, hidden_dim) and are already on the correct device.
+            Returned tensors are detached and remain on the model device.
         """
         try:
             # Extract weight matrices
-            if hasattr(attention_module, "q_proj") and hasattr(attention_module, "k_proj"):
+            if (
+                hasattr(attention_module, "q_proj")
+                and hasattr(attention_module, "k_proj")
+                and hasattr(attention_module, "v_proj")
+            ):
                 W_q = attention_module.q_proj.weight  # shape: (hidden_dim, hidden_dim)
                 W_k = attention_module.k_proj.weight  # shape: (hidden_dim, hidden_dim)
-            elif hasattr(attention_module, "q_proj_weight") and hasattr(attention_module, "k_proj_weight"):
+                W_v = attention_module.v_proj.weight
+            elif (
+                hasattr(attention_module, "q_proj_weight")
+                and hasattr(attention_module, "k_proj_weight")
+                and hasattr(attention_module, "v_proj_weight")
+            ):
                 W_q = attention_module.q_proj_weight
                 W_k = attention_module.k_proj_weight
+                W_v = attention_module.v_proj_weight
             else:
-                return None, None
+                return None, None, None
             
             # Ensure tensors are on the correct device and detached
             W_q = W_q.detach()
             W_k = W_k.detach()
+            W_v = W_v.detach()
             
-            return W_q, W_k
+            return W_q, W_k, W_v
         except (AttributeError, RuntimeError):
-            return None, None
+            return None, None, None
