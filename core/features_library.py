@@ -633,8 +633,7 @@ def compute_attention_gini(ctx: "HeadContext") -> float:
 def compute_max_attention_weight(ctx: "HeadContext") -> float:
     """
     Maximum single attention weight in the map (Peakiness).
-
-    Values near 1.0 indicate highly concentrated, spike-like attention.
+    expected to be almost always 1
     """
     try:
         return float(ctx.attention_map.max().item())
@@ -680,17 +679,11 @@ def compute_query_key_sim_mean(ctx: "HeadContext") -> float:
 # Attention Map: Structural Metrics
 # ==============================================================================
 
-def compute_attention_center_of_mass(ctx: "HeadContext") -> float:
+def compute_look_back(ctx: "HeadContext") -> float:
     """
-    Normalized look-back distance (attention center of mass).
+    Normalised look-back distance (Kumar et al., 2024).
+    LB_norm = (1/N) * sum_i sum_j [(i-j) * A_ij].
 
-    For each query position i, computes the attention-weighted mean of the
-    relative position j/i of attended keys, then averages over the sequence.
-    Values near 1.0 indicate local attention; values near 0.0 indicate
-    global or sink-style attention.
-
-    Mathematical Definition:
-        CenterMass = (1/N) * sum_i sum_j (j/i) * A[i,j]
     """
     try:
         A = ctx.attention_map
@@ -699,10 +692,10 @@ def compute_attention_center_of_mass(ctx: "HeadContext") -> float:
             return np.nan
         row = torch.arange(1, N + 1, dtype=torch.float32, device=A.device).unsqueeze(1)
         col = torch.arange(1, N + 1, dtype=torch.float32, device=A.device).unsqueeze(0)
-        weights = col / row.clamp(min=1e-8)
+        weights = (row - col).clamp(min=0) 
         return float((A * weights).sum() / N)
     except Exception as e:
-        print(f"Error in compute_attention_center_of_mass: {e}")
+        print(f"Error in compute_look_back: {e}")
         return np.nan
 
 
@@ -788,7 +781,7 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
     "query_key_sim_mean":           compute_query_key_sim_mean,
 
     # --- Attention Map: Structural ---
-    "attention_center_of_mass":     compute_attention_center_of_mass,
+    "look_back":                    compute_look_back,
 
     # --- Attention Map: Rank ---
     "effective_rank_A":             compute_effective_rank_A,
