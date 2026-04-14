@@ -833,14 +833,14 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
     "diagonal_mass_1_shifted_3":    compute_shifted_diagonal_mass_1_shift_3,
     "diagonal_mass_1_shifted_4":    compute_shifted_diagonal_mass_1_shift_4,
 
-    # --- Attention Map: Sink (per-token, independent) ---
+    # --- Attention Map: Sink (per-token) ---
     "sink_mass_token_0":            compute_sink_mass_token_0,
     "sink_mass_token_1":            compute_sink_mass_token_1,
     "sink_mass_token_2":            compute_sink_mass_token_2,
     "sink_mass_token_3":            compute_sink_mass_token_3,
     "sink_mass_token_4":            compute_sink_mass_token_4,
 
-    # --- Attention Map: Entropy and Sparsity ---
+    # --- Attention Map: Entropy and Variance ---
     "attention_entropy":            compute_attention_entropy,
     "attention_gini":               compute_attention_gini,
     "attention_row_var_weighted":   compute_attention_row_var_weighted,
