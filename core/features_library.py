@@ -268,86 +268,111 @@ def compute_k_sim_consecutive(ctx: "HeadContext") -> float:
 # ==============================================================================
 # SVD Alignment (H vs W_q, H vs W_k)
 # ==============================================================================
-
-def _top2_left_singular_vectors(matrix: torch.Tensor) -> torch.Tensor:
+def _top2_right_singular_vectors(matrix: torch.Tensor) -> torch.Tensor:
     """
-    Return the top-2 left singular vectors of a matrix.
-
-    Args:
-        matrix: 2D tensor of shape (m, n), m >= 2.
+    Return the top-2 right singular vectors of a matrix.
+    Both H and W live in R^{d_model} as their column space,
+    so right singular vectors are geometrically comparable across matrices.
 
     Returns:
-        Tensor of shape (2, m) with the first two left singular vectors as rows.
+        Tensor of shape (2, d_model) — top-2 rows of V^T.
     """
     m = matrix.detach().cpu().float()
     try:
-        U, _, _ = torch.linalg.svd(m, full_matrices=False)
+        _, _, Vt = torch.linalg.svd(m, full_matrices=False)
     except Exception:
-        U, _, _ = torch.svd(m)
-    return U[:, :2].T  # shape: (2, m)
+        _, _, Vt = torch.svd(m)
+        Vt = Vt.T
+    return Vt[:2]  # shape: (2, d_model)
 
+def _principal_angle_alignment(V1: torch.Tensor, V2: torch.Tensor) -> float:
+    """
+    Mean cosine of principal angles between subspaces spanned by rows of V1, V2.
+    V1: (k, d), V2: (k, d) — rows are orthonormal (from SVD).
+    sigma_i(V1 @ V2.T) = cos(theta_i), i=1..k.
+    1.0 = identical subspaces, 0.0 = orthogonal subspaces.
+    """
+    G = V1.cpu() @ V2.cpu().T          # (k, k) Gram matrix
+    cos_angles = torch.linalg.svdvals(G.float())   # [0, 1]
+    return float(cos_angles.mean().item())
 
 def compute_svd_alignment_H_Wq(ctx: "HeadContext") -> float:
     """
-    Mean cosine similarity between the top-2 left singular vectors of H and W_q.
-
-    This measures how much the principal directions of the input hidden space
-    are aligned with the principal directions of the query projection.
-
-    Mathematical Definition:
-        u1_H, u2_H = top-2 left singular vectors of H
-        u1_Wq, u2_Wq = top-2 left singular vectors of W_q
-        alignment = (cos(u1_H, u1_Wq) + cos(u2_H, u2_Wq)) / 2
+    Mean cosine of principal angles between the top-2 right singular
+    subspaces of H and W_q in the shared input space R^{d_model}.
+    Uses principal angles (optimal matching) instead of positional pairing.
     """
     try:
-        U_H = _top2_left_singular_vectors(ctx.H_input)   # (2, seq_len)
-        U_Wq = _top2_left_singular_vectors(ctx.W_q)      # (2, d_model or head_dim)
-
-        # Align to shorter dimension via dot product on common axis
-        # Both projected to their own spaces: use normalized dot product per pair
-        def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
-            a = a / (a.norm() + 1e-8)
-            b = b / (b.norm() + 1e-8)
-            # If dimensions differ, project to min size
-            min_d = min(a.shape[0], b.shape[0])
-            return float((a[:min_d] * b[:min_d]).sum().item())
-
-        sim1 = _cos(U_H[0], U_Wq[0])
-        sim2 = _cos(U_H[1], U_Wq[1])
-        return float(np.mean([abs(sim1), abs(sim2)]))
+        V_H  = _top2_right_singular_vectors(ctx.H_input)  # (2, d_model)
+        V_Wq = _top2_right_singular_vectors(ctx.W_q)      # (2, d_model)
+        return _principal_angle_alignment(V_H, V_Wq)
     except Exception as e:
         print(f"Error in compute_svd_alignment_H_Wq: {e}")
         return np.nan
 
-
 def compute_svd_alignment_H_Wk(ctx: "HeadContext") -> float:
     """
-    Mean cosine similarity between the top-2 left singular vectors of H and W_k.
-
-    Symmetric counterpart of compute_svd_alignment_H_Wq applied to the key
-    projection matrix. High values suggest that the key projection captures
-    the dominant variance directions of the input representation.
+    Mean cosine of principal angles between the top-2 right singular
+    subspaces of H and W_k in the shared input space R^{d_model}.
     """
     try:
-        U_H = _top2_left_singular_vectors(ctx.H_input)
-        U_Wk = _top2_left_singular_vectors(ctx.W_k)
-
-        def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
-            a = a / (a.norm() + 1e-8)
-            b = b / (b.norm() + 1e-8)
-            min_d = min(a.shape[0], b.shape[0])
-            return float((a[:min_d] * b[:min_d]).sum().item())
-
-        sim1 = _cos(U_H[0], U_Wk[0])
-        sim2 = _cos(U_H[1], U_Wk[1])
-        return float(np.mean([abs(sim1), abs(sim2)]))
+        V_H  = _top2_right_singular_vectors(ctx.H_input)  # (2, d_model)
+        V_Wk = _top2_right_singular_vectors(ctx.W_k)      # (2, d_model)
+        return _principal_angle_alignment(V_H, V_Wk)
     except Exception as e:
         print(f"Error in compute_svd_alignment_H_Wk: {e}")
         return np.nan
 
+def _get_cached_WqWk_svd(ctx: "HeadContext") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Cached full SVD of the head interaction matrix M = W_q @ W_k^T in R^{d_h x d_h}.
+
+    M_{ij} = (e_i^T W_q)(W_k^T e_j) captures the bilinear interaction
+    between query and key projected channels, independently of the input.
+    """
+    if 'svd_WqWk' not in ctx.cache:
+        Wq = ctx.W_q.detach().cpu().float()  # [d_h, d_model]
+        Wk = ctx.W_k.detach().cpu().float()  # [d_h, d_model]
+        M = Wq @ Wk.T                        # [d_h, d_h]
+        try:
+            U, S, Vh = torch.linalg.svd(M, full_matrices=False)
+        except Exception:
+            U, S, V = torch.svd(M)
+            Vh = V.T   # normalizza subito alla convenzione linalg
+        ctx.cache['svd_WqWk'] = (U, S, Vh)
+    return ctx.cache['svd_WqWk']
+
+
+def compute_WqWk_svd_alignment(ctx: "HeadContext") -> float:
+    """
+    Singular-value-weighted cosine similarity between left and right
+    singular vectors of the head interaction matrix M = W_q W_k^T.
+
+    Following Zhang et al. (NeurIPS 2024, arXiv:2405.14880), the attention
+    score decomposes into singular modes: each mode n contributes
+    sigma_n * (x_i^T u_n)(v_n^T x_j). A high weighted alignment means
+    the head's query and key sides 'look for the same features' in the
+    leading singular modes.
+
+    rho = sum_n  (sigma_n / sum_m sigma_m) * <u_n, v_n>
+
+    Note: u_n and v_n are already unit-norm (columns of U and V from SVD),
+    so <u_n, v_n> is directly their cosine similarity.
+    Input-independent: computed once per head over the weight matrices.
+    """
+    try:
+        U, S, Vh = _get_cached_WqWk_svd(ctx)
+        V = Vh.T  # [d_h, r]
+        cos_sim = (U * V).sum(dim=0)        # [r]
+        weights = S / (S.sum() + 1e-12)
+        return float((weights * cos_sim).sum().item())
+    except Exception as e:
+        print(f"Error in compute_WqWk_svd_alignment: {e}")
+        return np.nan
+    
 
 # ==============================================================================
-# RMSNorm Gamma and Channel-Wise Variance
+# RMSNorm Gamma and Channel-Wise Variance and Center of Mass of RoPE Frequencies
 # ==============================================================================
 
 def compute_rmsnorm_gamma_norm(ctx: "HeadContext") -> float:
@@ -367,37 +392,95 @@ def compute_rmsnorm_gamma_norm(ctx: "HeadContext") -> float:
         print(f"Error in compute_rmsnorm_gamma_norm: {e}")
         return np.nan
 
-
-def compute_channel_variance_Wq(ctx: "HeadContext") -> float:
+def _rope_pair_norms(W: torch.Tensor) -> torch.Tensor:
     """
-    Variance of the column norms of W_q across output channels.
+    Compute RoPE-pair norms for a projection matrix W of shape (d_h, d_model).
 
-    High variance indicates that certain output dimensions of W_q dominate
-    the projection, suggesting anisotropic channel structure that may produce
-    structured (non-uniform) key/query distributions.
+    RoPE rotates dimensions in consecutive pairs (2k, 2k+1) with the same
+    angular frequency theta_k. The natural unit of analysis is therefore
+    the pair norm:
+        c_k = sqrt(||W[:, 2k]||^2 + ||W[:, 2k+1]||^2)
+
+    Returns:
+        Tensor of shape (d_model // 2,) with one norm per frequency pair.
+    """
+    m = W.detach().cpu().float()
+    
+    row_norms_sq = (m ** 2).sum(dim=1)           # (d_h,)
+    pair_norms_sq = row_norms_sq.view(-1, 2).sum(dim=1)  # (d_h//2,)
+    return pair_norms_sq.sqrt()                           # (d_model//2,)
+
+
+def compute_rope_pair_var_Wq(ctx: "HeadContext") -> float:
+    """
+    Variance of RoPE-pair norms of W_q.
+
+    Groups columns of W_q into consecutive pairs (2k, 2k+1) corresponding
+    to RoPE frequency bands and computes the variance of their joint norms.
+    High variance indicates that the query projection concentrates energy
+    in specific RoPE frequency bands, making the head selective over
+    rotational frequencies.
     """
     try:
-        W = ctx.W_q.detach().cpu().float()
-        col_norms = torch.norm(W, dim=0)  # norm per output channel
-        return float(col_norms.var().item())
+        pair_norms = _rope_pair_norms(ctx.W_q)
+        return float(pair_norms.var().item())
     except Exception as e:
-        print(f"Error in compute_channel_variance_Wq: {e}")
+        print(f"Error in compute_rope_pair_var_Wq: {e}")
         return np.nan
 
 
-def compute_channel_variance_Wk(ctx: "HeadContext") -> float:
+def compute_rope_pair_var_Wk(ctx: "HeadContext") -> float:
     """
-    Variance of the column norms of W_k across output channels.
+    Variance of RoPE-pair norms of W_k.
 
-    Symmetric counterpart of compute_channel_variance_Wq. Captures
-    channel-level anisotropy in the key projection.
+    Symmetric counterpart of compute_rope_pair_var_Wq applied to the key
+    projection matrix.
     """
     try:
-        W = ctx.W_k.detach().cpu().float()
-        col_norms = torch.norm(W, dim=0)
-        return float(col_norms.var().item())
+        pair_norms = _rope_pair_norms(ctx.W_k)
+        return float(pair_norms.var().item())
     except Exception as e:
-        print(f"Error in compute_channel_variance_Wk: {e}")
+        print(f"Error in compute_rope_pair_var_Wk: {e}")
+        return np.nan
+
+
+def compute_rope_freq_com_Wq(ctx: "HeadContext") -> float:
+    """
+    RoPE frequency center of mass of W_q.
+
+    Computes the attention-weighted mean frequency index:
+        FreqCoM = sum_k(k * c_k) / sum_k(c_k)
+
+    Low values: projection energy concentrated in low-frequency pairs
+                -> long-range dependencies, global/sink-like heads.
+    High values: energy concentrated in high-frequency pairs
+                -> local patterns, near-diagonal/slash heads.
+    """
+    try:
+        pair_norms = _rope_pair_norms(ctx.W_q)
+        K = pair_norms.shape[0]
+        indices = torch.arange(K, dtype=torch.float32)
+        com = float((indices * pair_norms).sum() / (pair_norms.sum() + 1e-12))
+        return com
+    except Exception as e:
+        print(f"Error in compute_rope_freq_com_Wq: {e}")
+        return np.nan
+
+
+def compute_rope_freq_com_Wk(ctx: "HeadContext") -> float:
+    """
+    RoPE frequency center of mass of W_k.
+
+    Symmetric counterpart of compute_rope_freq_com_Wq applied to W_k.
+    """
+    try:
+        pair_norms = _rope_pair_norms(ctx.W_k)
+        K = pair_norms.shape[0]
+        indices = torch.arange(K, dtype=torch.float32)
+        com = float((indices * pair_norms).sum() / (pair_norms.sum() + 1e-12))
+        return com
+    except Exception as e:
+        print(f"Error in compute_rope_freq_com_Wk: {e}")
         return np.nan
 
 
@@ -493,19 +576,19 @@ def compute_shifted_diagonal_mass_1_shift_2(ctx: "HeadContext") -> float:
         return np.nan
     
 def compute_shifted_diagonal_mass_1_shift_3(ctx: "HeadContext") -> float:
-    """Fraction of attention mass exactly 2 tokens ago (shift=2)."""
+    """Fraction of attention mass exactly 3 tokens ago (shift=3)."""
     try:
         return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=3)
     except Exception as e:
-        print(f"Error in compute_shifted_diagonal_mass_1_shift_2: {e}")
+        print(f"Error in compute_shifted_diagonal_mass_1_shift_3: {e}")
         return np.nan
     
 def compute_shifted_diagonal_mass_1_shift_4(ctx: "HeadContext") -> float:
-    """Fraction of attention mass exactly 2 tokens ago (shift=2)."""
+    """Fraction of attention mass exactly 4 tokens ago (shift=4)."""
     try:
         return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=4)
     except Exception as e:
-        print(f"Error in compute_shifted_diagonal_mass_1_shift_2: {e}")
+        print(f"Error in compute_shifted_diagonal_mass_1_shift_4: {e}")
         return np.nan
 
 # ==============================================================================
@@ -630,49 +713,33 @@ def compute_attention_gini(ctx: "HeadContext") -> float:
         return np.nan
 
 
-def compute_max_attention_weight(ctx: "HeadContext") -> float:
-    """
-    Maximum single attention weight in the map (Peakiness).
-    expected to be almost always 1
-    """
-    try:
-        return float(ctx.attention_map.max().item())
-    except Exception as e:
-        print(f"Error in compute_max_attention_weight: {e}")
-        return np.nan
 
 
-def compute_attention_variance_per_query(ctx: "HeadContext") -> float:
+def compute_attention_row_var_weighted(ctx: "HeadContext") -> float:
     """
-    Mean variance of each query row in the attention map.
-
-    High values indicate selective attention per query position.
-    Low values suggest diffuse or uniform attention rows.
+    Degrees-of-freedom weighted mean of per-row variances of A.
+    Rows are weighted by their number of valid causal elements (i+1),
+    correcting for instability of variance estimates in early rows.
     """
     try:
-        return float(torch.var(ctx.attention_map, dim=1).mean().item())
-    except Exception as e:
-        print(f"Error in compute_attention_variance_per_query: {e}")
-        return np.nan
-
-
-def compute_query_key_sim_mean(ctx: "HeadContext") -> float:
-    """
-    Mean element-wise cosine similarity between Q and K vectors.
-
-    Measures average geometric alignment between queries and keys,
-    independent of their dot-product magnitudes.
-    """
-    try:
-        Q, K = ctx.Q, ctx.K
-        if Q.shape[0] != K.shape[0]:
+        A = ctx.attention_map.float()  # [N, N]
+        N = A.shape[0]
+        if N < 2:
             return np.nan
-        Q_norm = Q / (torch.norm(Q, dim=1, keepdim=True) + 1e-8)
-        K_norm = K / (torch.norm(K, dim=1, keepdim=True) + 1e-8)
-        return float((Q_norm * K_norm).sum(dim=1).mean().item())
+        weights, variances = [], []
+        mask = torch.tril(torch.ones(N, N, dtype=torch.bool, device=A.device))
+        mask[0] = False  # skip row 0
+        counts = mask.sum(dim=1).float()  # (N,)
+        means = (A * mask).sum(dim=1) / counts.clamp(min=1)
+        sq_diff = ((A - means.unsqueeze(1)) ** 2) * mask
+        variances = sq_diff.sum(dim=1) / counts.clamp(min=1)
+        weights = counts
+        return float((weights[1:] * variances[1:]).sum() / weights[1:].sum())
+
     except Exception as e:
-        print(f"Error in compute_query_key_sim_mean: {e}")
+        print(f"Error in compute_attention_row_var_weighted: {e}")
         return np.nan
+
 
 
 # ==============================================================================
@@ -752,11 +819,14 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
     # --- SVD Alignment (H vs projections) ---
     "svd_alignment_H_Wq":          compute_svd_alignment_H_Wq,
     "svd_alignment_H_Wk":          compute_svd_alignment_H_Wk,
+    "WqWk_svd_alignment":          compute_WqWk_svd_alignment,
 
     # --- RMSNorm and Channel Structure ---
     "rmsnorm_gamma_norm":           compute_rmsnorm_gamma_norm,
-    "channel_variance_Wq":          compute_channel_variance_Wq,
-    "channel_variance_Wk":          compute_channel_variance_Wk,
+    "rope_pair_var_Wq":          compute_rope_pair_var_Wq,
+    "rope_pair_var_Wk":          compute_rope_pair_var_Wk,
+    "rope_freq_com_Wq":             compute_rope_freq_com_Wq,
+    "rope_freq_com_Wk":             compute_rope_freq_com_Wk,
 
     # --- Attention Map: Diagonal ---
     "diagonal_mass_1":              compute_diagonal_mass_1,
@@ -776,9 +846,7 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
     # --- Attention Map: Entropy and Sparsity ---
     "attention_entropy":            compute_attention_entropy,
     "attention_gini":               compute_attention_gini,
-    "max_attention_weight":         compute_max_attention_weight,
-    "attention_variance_per_query": compute_attention_variance_per_query,
-    "query_key_sim_mean":           compute_query_key_sim_mean,
+    "attention_row_var_weighted":   compute_attention_row_var_weighted,
 
     # --- Attention Map: Structural ---
     "look_back":                    compute_look_back,
