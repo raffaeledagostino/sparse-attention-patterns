@@ -347,11 +347,8 @@ def compute_WqWk_svd_alignment(ctx: "HeadContext") -> float:
     """
     Singular-value-weighted cosine similarity between left and right
     singular vectors of the head interaction matrix M = W_q W_k^T.
-
-    Following Zhang et al. (NeurIPS 2024, arXiv:2405.14880), the attention
-    score decomposes into singular modes: each mode n contributes
-    sigma_n * (x_i^T u_n)(v_n^T x_j). A high weighted alignment means
-    the head's query and key sides 'look for the same features' in the
+    A high weighted alignment means the head's query and key sides 'look 
+    for the same features' in the
     leading singular modes.
 
     rho = sum_n  (sigma_n / sum_m sigma_m) * <u_n, v_n>
