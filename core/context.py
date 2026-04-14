@@ -30,6 +30,7 @@ class HeadContext:
     K:              torch.Tensor
     attention_map:  torch.Tensor
     rmsnorm_gamma:  Optional[torch.Tensor] = None
+    q_k_pre_rope: bool = False          
     cache:          Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):

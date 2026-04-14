@@ -2,20 +2,25 @@
 
 A highly modular, memory-efficient PyTorch pipeline for extracting mathematical features from LLM attention matrices. Designed for Apple Silicon (M2) and single-machine inference constraints.
 
+**Status**: Core single-prompt analysis code is production-ready. Batch analysis utilities are under development (see [Batch Analysis](#batch-analysis) section).
+
 ## Table of Contents
 
 - [Overview](#overview)
 - [Architecture](#architecture)
-- [Setup](#setup)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-  - [Basic Command](#basic-command)
-  - [Command-Line Arguments](#command-line-arguments)
-  - [Example Workflows](#example-workflows)
-- [How to Add a New Feature](#how-to-add-a-new-feature)
-- [How to Add a New Prompt](#how-to-add-a-new-prompt)
-- [How to Add a New Model](#how-to-add-a-new-model)
-- [Module Reference](#module-reference)
+  - [Eager Eviction Pattern](#eager-eviction-pattern)
+  - [Module Organization](#module-organization)
+  - [Data Flow](#data-flow)
+- [Core Modules](#core-modules)
+  - [LightweightAttentionAnalyzer](#lightweightattentionanalyzer)
+  - [HeadContext](#headcontext)
+  - [Features Library](#features-library)
+  - [Persistence](#persistence)
+- [How It Works](#how-it-works)
+- [Batch Analysis](#batch-analysis)
+- [Usage Examples](#usage-examples)
+- [Extensibility](#extensibility)
+  - [Adding a New Feature](#adding-a-new-feature)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
 
@@ -23,16 +28,17 @@ A highly modular, memory-efficient PyTorch pipeline for extracting mathematical 
 
 ## Overview
 
-This pipeline extracts mathematical features from attention heads in transformers (like Qwen, LLaMA, Mistral) and saves them to a tabular dataset (Parquet/CSV). It targets the constraints of single-machine inference on Apple Silicon hardware.
+This pipeline extracts mathematical features from attention heads in transformer models (like Qwen, LLaMA, Mistral) and saves them to a structured dataset (Parquet). It's optimized for single-machine inference on Apple Silicon hardware, with explicit memory management to prevent out-of-memory errors during analysis.
 
 ### Key Capabilities
 
 - **In-Memory Analysis**: Forward pass computation fully in memory without intermediate disk writes.
 - **Memory-Efficient**: Implements "Eager Eviction"—explicit tensor deletion after use and garbage collection after each layer to prevent OOM.
 - **Modular Feature System**: Add new mathematical metrics without retraining or re-running all features.
-- **Multi-Head Analysis**: Extracts features per attention head across specified layers.
+- **Per-Head Analysis**: Extracts features for each attention head across specified layers.
 - **GQA Support**: Correctly handles Grouped Query Attention (KV head replication).
-- **Safe Dataset Append**: Never overwrites existing data; appends atomically to persistent storage.
+- **Idempotent Dataset Append**: Never overwrites existing data; appends atomically with deduplication on primary key.
+- **Device Agnostic**: Supports Apple Silicon (MPS), CUDA, and CPU backends.
 
 ### Mathematical Features Included
 
@@ -53,51 +59,357 @@ This pipeline extracts mathematical features from attention heads in transformer
 
 ### Eager Eviction Pattern
 
-Memory is the primary constraint on Apple Silicon M2. We adopt an **Eager Eviction** strategy:
+Memory is the primary constraint on Apple Silicon M2. We adopt an **Eager Eviction** strategy to minimize peak memory usage:
 
-1. **Compute on-the-fly**: Q and K are computed from hidden states and weight projections, not pre-computed and stored.
-2. **Process sequentially**: Layers are processed one at a time, never holding multiple layers' tensors simultaneously.
-3. **Explicit deletion**: After each layer, all large tensors (H, W_q, W_k, A) are explicitly `del`'ed.
-4. **Cache clearing**: `gc.collect()` and `torch.mps.empty_cache()` (for MPS) are called to ensure memory is truly freed.
-5. **Per-head computation**: Features are computed immediately after creating each `HeadContext`, then the head tensors (Q, K) are deleted.
+1. **Compute on-the-fly**: Query and Key vectors are computed from hidden states and weight projections at analysis time, not pre-computed and stored.
+2. **Process sequentially**: Each layer is processed independently; we never hold multiple layers' tensors in memory simultaneously.
+3. **Explicit deletion**: After each layer, all large tensors (hidden state, weight projections, computed Q/K) are explicitly deleted using `del`.
+4. **Cache clearing**: After each layer, `gc.collect()` and `torch.mps.empty_cache()` (or `torch.cuda.empty_cache()`) are called to ensure memory is truly freed.
+5. **Per-head feature computation**: Features are computed immediately after creating each `HeadContext`; the head tensors (Q, K) are then deleted.
+
+This pattern ensures that only one layer's worth of tensors exists in memory at any time, allowing analysis of large models on memory-constrained devices.
 
 ### Module Organization
 
 ```
-core/
-├── __init__.py              # Package initialization
-├── context.py               # HeadContext dataclass
-├── features_library.py      # Mathematical feature functions + FEATURE_REGISTRY
-├── analyzer.py              # LightweightAttentionAnalyzer class
-└── dataset_manager.py       # DatasetManager for safe persistent storage
-
-main.py                       # Entry point script
-README.md                     # This file
+sparse-attention-patterns/
+├── config.py                         # Centralized configuration constants
+├── pipeline.py                       # Core analysis orchestration (single-prompt analysis)
+├── core/
+│   ├── __init__.py
+│   ├── context.py                   # HeadContext: encapsulates attention head state
+│   ├── features_library.py          # Mathematical feature functions + FEATURE_REGISTRY
+│   └── analyzer.py                  # LightweightAttentionAnalyzer: main entry point
+├── data/
+│   ├── __init__.py
+│   ├── persistence.py               # Parquet/CSV persistence with deduplication
+│   └── prompt_sources.py            # (Placeholder for prompt source abstraction)
+├── batch_analysis.py                # Batch processing orchestration (under development)
+├── README.md                        # This file
+└── dataset.ipynb                    # Jupyter notebook for exploration
 ```
 
 ### Data Flow
 
 ```
-User Command (main.py)
+User calls analyze_prompt(prompt_text)
     ↓
 LightweightAttentionAnalyzer.analyze_prompt()
-    ├─ Tokenize prompt
+    ├─ Tokenize prompt → input_ids
     ├─ Forward pass (output_attentions=True, output_hidden_states=True)
-    ├─ For each layer:
-    │  ├─ Extract hidden state H
-    │  ├─ Extract W_q, W_k from model weights
-    │  └─ For each head:
-    │     ├─ Compute Q, K on-the-fly
-    │     ├─ Extract attention map A
-    │     ├─ Create HeadContext
-    │     ├─ Run all features via get_all_features()
-    │     └─ Collect results
-    │  └─ Delete tensors, call gc.collect() and empty_cache()
+    ├─ Extract outputs.attentions, outputs.hidden_states
+    ├─ For each layer_idx in [0, num_layers):
+    │   ├─ Extract hidden_state H_input from hidden_states[layer_idx]
+    │   ├─ Get attention_module (self_attn layer)
+    │   ├─ Extract weight_projections: W_q, W_k, W_v
+    │   ├─ Compute Q_all = H_input @ W_q.T  (all heads)
+    │   ├─ Compute K_all = H_input @ W_k.T  (all heads)
+    │   ├─ For each head_idx in [0, num_heads):
+    │   │   ├─ Extract individual Q, K from Q_all, K_all
+    │   │   ├─ Get attention_map from attentions[layer_idx]
+    │   │   ├─ Create HeadContext(Q, K, attention_map, ...)
+    │   │   ├─ Call get_all_features(ctx) → compute all registered features
+    │   │   ├─ Build result dict and append to results
+    │   │   └─ Delete Q, K, ctx (eager cleanup)
+    │   ├─ Delete H_input, W_q, W_k, W_v, Q_all, K_all
+    │   └─ Call gc.collect() and torch.mps.empty_cache()
+    ├─ Return results: List[Dict] with metadata and features
     ↓
-DatasetManager.append_records()
-    ├─ Load existing dataset (if any)
-    ├─ Concatenate new records
-    └─ Write to disk (Parquet or CSV)
+save_results(results, output_path, primary_key)
+    ├─ Convert results to DataFrame
+    ├─ Load existing output_path (if exists)
+    ├─ Concatenate and deduplicate on primary_key
+    └─ Write to parquet
+```
+
+---
+
+## Core Modules
+
+### LightweightAttentionAnalyzer
+
+**File**: `core/analyzer.py`
+
+The main entry point for single-prompt analysis. Orchestrates the entire feature extraction pipeline.
+
+**Key Methods**:
+
+- `__init__(model_name, device=None, local_files_only=False)`: Load model and tokenizer.
+  - Automatically detects MPS/CUDA/CPU device if not specified.
+  - Sets attention implementation (eager) and ensures pad token is configured.
+
+- `analyze_prompt(prompt, max_length=128, layer_indices=None, head_indices=None)`: Analyze a single prompt.
+  - **Returns**: `List[Dict]` with one entry per (layer, head) pair.
+  - Each dict contains: `model_name`, `layer_idx`, `head_idx`, `prompt_len`, and all computed features.
+  - Implements Eager Eviction: deletes tensors after each layer and calls garbage collection.
+
+**Internal Methods**:
+
+- `_detect_device()`: Static method to select appropriate device (MPS > CUDA > CPU).
+- `_get_attention_module(layer_idx)`: Extract the `self_attn` module from a given layer.
+- `_extract_weight_projections(attention_module)`: Get Q, K, V weight matrices and biases from the attention module.
+
+**GQA Handling**: Correctly maps query heads to KV heads when the model uses Grouped Query Attention (e.g., via `num_key_value_heads < num_heads`).
+
+---
+
+### HeadContext
+
+**File**: `core/context.py`
+
+A dataclass that encapsulates the complete computational state of a single attention head.
+
+**Attributes**:
+
+- **Model metadata**: `model_name`, `layer_idx`, `head_idx`, `prompt_len`
+- **Input tensors**: `H_input` (hidden states), `W_q`, `W_k`, `W_v` (weight projections)
+- **Computed tensors**: `Q` (queries), `K` (keys), `attention_map` (attention weights)
+- **Optional**: `rmsnorm_gamma` (RMSNorm scaling, if applicable)
+- **Cache**: `cache: Dict[str, Any]` for memoizing expensive computations (e.g., SVD results)
+
+**dtype Normalization**: The `__post_init__` method normalizes all tensors to float32 on CPU. This is the single point of dtype normalization in the pipeline, converting bfloat16 (Qwen native) and float16 to a consistent float32 representation.
+
+---
+
+### Features Library
+
+**File**: `core/features_library.py`
+
+A collection of pure mathematical functions for computing scalar metrics from attention matrices and related tensors. All functions are registered in `FEATURE_REGISTRY`, making them discoverable and dynamically invocable.
+
+**Key Design Principles**:
+
+- **Pure functions**: Each feature function is side-effect free and returns a scalar float (or `np.nan` on failure).
+- **CPU SVD**: All SVD computations are dispatched to CPU for Apple Silicon compatibility.
+- **Memoization**: Expensive computations (e.g., SVD singular values) are cached in `ctx.cache` to avoid recomputation.
+- **Single Registry**: `FEATURE_REGISTRY` is the authoritative source of truth; all features are registered here.
+
+**Feature Functions**:
+
+Each function has the signature `def feature_name(ctx: HeadContext) -> float` and operates on the tensors stored in `HeadContext`.
+
+Key utilities:
+- `_svdvals_cpu(matrix)`: Compute singular values on CPU (MPS-safe).
+- `_compute_rank_metrics(matrix)`: Compute effective rank and R_95 from a single SVD.
+- `_get_cached_rank(ctx, key, matrix)`: Access cached rank metrics or compute on first access.
+- `get_all_features(ctx)`: Run all registered features and return a dictionary.
+
+---
+
+### Persistence
+
+**File**: `data/persistence.py`
+
+Safe, idempotent dataset persistence with deduplication.
+
+**Key Function**:
+
+- `save_results(results, output_path, primary_key)`: Append results to a Parquet file.
+  - If the file exists: loads, concatenates, deduplicates on `primary_key` (keeping the latest), and rewrites.
+  - If the file doesn't exist: creates it.
+  - Prints row counts for transparency.
+
+**Deduplication Strategy**: Uses Pandas `drop_duplicates(subset=primary_key, keep='last')` to ensure that if the same (model, prompt, layer, head) tuple is reanalyzed, the new result replaces the old one.
+
+---
+
+## How It Works
+
+### Single-Prompt Analysis Workflow
+
+1. **Initialization**:
+   ```python
+   from core.analyzer import LightweightAttentionAnalyzer
+   
+   analyzer = LightweightAttentionAnalyzer(
+       model_name="Qwen/Qwen2.5-0.5B-Instruct",
+       device="mps"  # or "cuda" / "cpu"
+   )
+   ```
+
+2. **Analysis**:
+   ```python
+   results = analyzer.analyze_prompt(
+       prompt="What is 2 + 2?",
+       max_length=128,
+       layer_indices=[0, 1, 2],  # Only first 3 layers
+       head_indices=None          # All heads
+   )
+   ```
+
+3. **Persistence**:
+   ```python
+   from data.persistence import save_results
+   from config import OUTPUT_PATH, PRIMARY_KEY
+   
+   df = save_results(results, OUTPUT_PATH, PRIMARY_KEY)
+   print(df.head())
+   ```
+
+### Memory-Efficiency Details
+
+- **Hidden state extraction**: `H_input = hidden_states[layer_idx]` is a view (no copy). Dimensions: `(seq_len, hidden_dim)`.
+- **Weight projection extraction**: `W_q`, `W_k`, `W_v` are extracted once per layer and immediately split by head.
+- **Q/K computation**: Computed once per layer (all heads): `Q_all = H_input @ W_q.T`, then sliced by head. This is more efficient than computing per-head since the full matrix multiplication is hardware-optimized.
+- **Per-head cleanup**: Each head's Q, K tensors are deleted immediately after feature computation.
+- **Layer cleanup**: After all heads are processed, the layer's H_input, W_q, W_k, W_v, and intermediate computations are deleted.
+- **GC and cache clearing**: After each layer, `gc.collect()` and device-specific cache clearing are called to ensure memory is truly freed, not just marked for reclamation.
+
+---
+
+## Batch Analysis
+
+**File**: `batch_analysis.py` (under development)
+
+Batch analysis utilities for processing multiple prompts with checkpoint-aware resumption and progress tracking.
+
+**Status**: Currently being refinement and validation. Use single-prompt analysis via `pipeline.py::run_analysis()` for production work.
+
+**Functions** (when stable):
+
+- `run_analysis_batch(analyzer, source, prompt_indices, ...)`: Process a sequence of prompts with resumption and progress reporting.
+- Helper functions: `_load_existing_prompt_ids()`, `_format_elapsed()`, `_cleanup_device()`.
+
+See batch_analysis.py for current implementation and limitations.
+
+---
+
+## Usage Examples
+
+### Example 1: Analyze a Single Prompt
+
+```python
+from core.analyzer import LightweightAttentionAnalyzer
+from data.persistence import save_results
+from config import OUTPUT_PATH, PRIMARY_KEY
+
+# Initialize analyzer
+analyzer = LightweightAttentionAnalyzer(model_name="Qwen/Qwen2.5-0.5B-Instruct")
+
+# Analyze a prompt
+results = analyzer.analyze_prompt(
+    prompt="The quick brown fox jumps over the lazy dog.",
+    max_length=128
+)
+
+# Save results
+df = save_results(results, OUTPUT_PATH, PRIMARY_KEY)
+print(f"Analyzed {len(df)} attention heads. Sample row:")
+print(df.iloc[0])
+```
+
+### Example 2: Analyze Specific Layers and Heads
+
+```python
+# Only analyze layers 5-10, heads 0-3
+results = analyzer.analyze_prompt(
+    prompt="Example text",
+    layer_indices=[5, 6, 7, 8, 9, 10],
+    head_indices=[0, 1, 2, 3]
+)
+```
+
+### Example 3: Switch between Models
+
+```python
+# Clear old model and load a new one
+del analyzer
+torch.cuda.empty_cache()  # or torch.mps.empty_cache()
+
+analyzer = LightweightAttentionAnalyzer(
+    model_name="meta-llama/Llama-2-7b"
+)
+```
+
+---
+
+## Extensibility
+
+### Adding a New Feature
+
+To add a new mathematical feature:
+
+1. **Define the feature function** in `core/features_library.py`:
+   ```python
+   def my_new_feature(ctx: HeadContext) -> float:
+       """Brief description of the feature."""
+       try:
+           # Compute your metric from ctx.Q, ctx.K, ctx.attention_map, etc.
+           result = some_computation(ctx)
+           return float(result)
+       except Exception:
+           return np.nan
+   ```
+
+2. **Register it in FEATURE_REGISTRY**:
+   ```python
+   FEATURE_REGISTRY["my_new_feature"] = my_new_feature
+   ```
+
+3. **Test it**:
+   ```python
+   from core.features_library import get_all_features, FEATURE_REGISTRY
+   
+   # Run all features
+   features = get_all_features(ctx)
+   print(f"my_new_feature = {features['my_new_feature']}")
+   ```
+
+4. **Rerun analysis** (if desired): Since features are computed dynamically on each call, your next analysis run will include the new feature. No need to recompute historical data unless you want to backfill.
+
+**Guidelines**:
+
+- Keep features **pure**: no side effects, no I/O, no state modification.
+- Always handle edge cases and return `np.nan` on failure.
+- Use `ctx.cache` for memoization of expensive computations (e.g., SVD).
+- Prefer CPU for SVD due to MPS/autograd issues; use `_svdvals_cpu()`.
+
+---
+
+## Best Practices
+
+1. **Memory Management**: Always run on a device with sufficient memory. On Apple Silicon, expect ~3-5 GB for a 7B model analyzing short prompts.
+
+2. **Batch vs. Single Analysis**: Use `run_analysis()` for single prompts. Batch analysis functions are still under development.
+
+3. **Deduplication**: The pipeline never overwrites existing records; it deduplicates on the primary key. You can safely rerun without losing data.
+
+4. **Device Persistence**: Stick to one device per analyzer instance. Create a new analyzer if switching devices.
+
+5. **Prompt Length**: Longer prompts use more memory (quadratic for attention); keep `max_length` reasonable or process in chunks.
+
+6. **Feature Inspection**: Check `FEATURE_REGISTRY` to see all available features:
+   ```python
+   from core.features_library import FEATURE_REGISTRY
+   print(list(FEATURE_REGISTRY.keys()))
+   ```
+
+---
+
+## Troubleshooting
+
+### Out of Memory (OOM)
+
+- **Reduce `max_length`**: Attention computation is O(seq_len²); shorter prompts use quadratically less memory.
+- **Analyze fewer heads**: Pass `head_indices` to skip unnecessary heads.
+- **Analyze fewer layers**: Pass `layer_indices` to skip unnecessary layers.
+- **Switch to CPU**: MPS caching can be unpredictable; try CPU if available.
+
+### Model Loading Fails
+
+- **Check HuggingFace API**: Ensure you have internet access or cached models locally.
+- **Set `local_files_only=True`**: To use only cached models.
+- **Trust remote code**: Ensure `TRUST_REMOTE_CODE=True` in `config.py` for custom model implementations (e.g., Qwen).
+
+### Attention Weights Not Extracted
+
+- Ensure the model uses `attn_implementation="eager"` (not Flash Attention, which doesn't expose per-head attention weights).
+- Check `ATTN_IMPLEMENTATION` in `config.py`.
+
+### Device Not Found
+
+- **MPS not available**: Model will fall back to CPU. For CUDA, install torch with CUDA support.
+- Check device detection: `LightweightAttentionAnalyzer._detect_device()`.
 ```
 
 ---
