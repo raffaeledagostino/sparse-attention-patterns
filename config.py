@@ -35,3 +35,4 @@ PROMPT_PREVIEW_CHARS = 100
 # ── Persistence ──────────────────────────────────────────────────────────
 OUTPUT_PATH = Path("data/attention_features.parquet")
 PRIMARY_KEY = ["model_name", "prompt_id", "layer_idx", "head_idx"]
+# trigger test
