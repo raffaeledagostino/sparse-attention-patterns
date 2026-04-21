@@ -244,12 +244,14 @@ class LightweightAttentionAnalyzer:
                 # ------------------------------------------------------------------
                 Q_raw = H_input @ W_q.T
                 if hasattr(attention_module, "q_proj") and attention_module.q_proj.bias is not None:
-                    Q_raw = Q_raw + attention_module.q_proj.bias
+                    q_bias = attention_module.q_proj.bias.to(H_input.device)
+                    Q_raw = Q_raw + q_bias
                 Q_all = Q_raw.reshape(seq_len, num_q_heads, head_dim)
 
                 K_raw = H_input @ W_k.T
                 if hasattr(attention_module, "k_proj") and attention_module.k_proj.bias is not None:
-                    K_raw = K_raw + attention_module.k_proj.bias
+                    k_bias = attention_module.k_proj.bias.to(H_input.device)
+                    K_raw = K_raw + k_bias
                 K_all = K_raw.reshape(seq_len, num_kv_heads, head_dim)
 
                 if hasattr(attention_module, "q_norm") and attention_module.q_norm is not None:
