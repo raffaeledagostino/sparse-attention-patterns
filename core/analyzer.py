@@ -14,12 +14,13 @@ from typing import List, Dict, Tuple, Optional, Any
 import gc
 import inspect
 import warnings
+from contextlib import nullcontext
 import torch
 import numpy as np
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from config import ATTN_IMPLEMENTATION
+from config import ATTN_IMPLEMENTATION, INFERENCE_FP16_CUDA
 
 
 _orig_is_autocast_enabled = torch.is_autocast_enabled
@@ -87,6 +88,8 @@ class LightweightAttentionAnalyzer:
         """
         self.model_name = model_name
         self.device = device or self._detect_device()
+        self.use_fp16_cuda = self.device == "cuda" and INFERENCE_FP16_CUDA
+        self.inference_dtype = torch.float16 if self.use_fp16_cuda else "auto"
         
         print(f"[Analyzer] Loading model '{model_name}' on device '{self.device}'...")
         _device_map = {
@@ -97,7 +100,7 @@ class LightweightAttentionAnalyzer:
         try:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
-                dtype="auto",
+                torch_dtype=self.inference_dtype,
                 device_map=_device_map[self.device],
                 trust_remote_code=True,
                 attn_implementation=ATTN_IMPLEMENTATION,
@@ -125,6 +128,16 @@ class LightweightAttentionAnalyzer:
             if hasattr(self.model.config, "_attn_implementation"):
                 self.model.config._attn_implementation = ATTN_IMPLEMENTATION
         print(f"[Analyzer] Model loaded successfully. Using {self.model.config.num_hidden_layers} layers.")
+        if self.use_fp16_cuda:
+            print("[Analyzer] Inference precision: FP16 (CUDA autocast enabled).")
+        elif self.device == "cuda":
+            print("[Analyzer] Inference precision: default model dtype (CUDA autocast disabled by config).")
+
+    def _forward_autocast_ctx(self):
+        """Use FP16 autocast for CUDA inference and no autocast elsewhere."""
+        if self.use_fp16_cuda:
+            return torch.autocast(device_type="cuda", dtype=torch.float16)
+        return nullcontext()
     
     @staticmethod
     def _detect_device() -> str:
@@ -159,12 +172,13 @@ class LightweightAttentionAnalyzer:
         print(f"[Analyzer] Running forward pass...")
         try:
             with torch.no_grad():
-                outputs = self.model(
-                    input_ids,
-                    output_attentions=True,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
+                with self._forward_autocast_ctx():
+                    outputs = self.model(
+                        input_ids,
+                        output_attentions=True,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
             print("[Analyzer] Q/K extraction mode: post-normalization, pre-RoPE (all models).")
         except Exception as e:
             raise RuntimeError(f"Forward pass failed: {e}")

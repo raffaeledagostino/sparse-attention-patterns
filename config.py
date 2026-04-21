@@ -19,6 +19,7 @@ DEVICE_MAP = "auto"
 
 # ── Attention ────────────────────────────────────────────────────────────
 ATTN_IMPLEMENTATION = "eager"
+INFERENCE_FP16_CUDA = True
 
 
 # ── Dataset / Pipeline ───────────────────────────────────────────────────

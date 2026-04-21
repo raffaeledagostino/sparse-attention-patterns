@@ -45,10 +45,11 @@ class DatasetPromptSource(PromptSource):
     def _load(self) -> None:
         if self._docs is None:
             ds = load_dataset(self.dataset_name, self.dataset_config, split=self.split)
+            # Pre-filtra per lunghezza chars prima ancora di tokenizzare
+            min_chars_threshold = max(self.min_chars, self.target_tokens * 3)
             self._docs = [
-                text
-                for text in ds[self.text_column]
-                if isinstance(text, str) and len(text.strip()) >= self.min_chars
+                text for text in ds[self.text_column]
+                if isinstance(text, str) and len(text.strip()) >= min_chars_threshold
             ]
 
     @property
@@ -59,19 +60,23 @@ class DatasetPromptSource(PromptSource):
 
     def get_prompt(self, idx: int = 0) -> tuple[str, str]:
         self._load()
-        for offset, text in enumerate(self._docs[idx:], start=idx):
+        count = 0
+        for offset, text in enumerate(self._docs):
             ids = self.tokenizer(text, return_tensors="pt").input_ids
             if ids.shape[1] >= self.target_tokens:
-                prompt = self.tokenizer.decode(
-                    ids[0, : self.target_tokens],
-                    skip_special_tokens=True,
-                )
-                prompt_id = f"{self.source_tag}_doc{offset}_{self.target_tokens}tok"
-                return prompt, prompt_id
+                if count == idx:
+                    prompt = self.tokenizer.decode(
+                        ids[0, :self.target_tokens],
+                        skip_special_tokens=True,
+                    )
+                    prompt_id = f"{self.source_tag}_doc{offset}_{self.target_tokens}tok"
+                    return prompt, prompt_id
+                count += 1
 
         raise ValueError(
-            f"No document with >= {self.target_tokens} tokens found from idx={idx} in '{self.source_tag}'."
+            f"Not enough documents with >= {self.target_tokens} tokens in '{self.source_tag}'."
         )
+
 
 
 class RandomTokenPromptSource(PromptSource):
@@ -107,5 +112,11 @@ class RandomTokenPromptSource(PromptSource):
         rng = np.random.default_rng(self.seed_base + idx)
         token_ids = rng.choice(self._vocab_ids, size=self.target_tokens, replace=True)
         prompt = self.tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)
+        rechecked = self.tokenizer(prompt, return_tensors="pt").input_ids
+        if rechecked.shape[1] < self.target_tokens:
+            extra = rng.choice(self._vocab_ids, size=self.target_tokens // 2, replace=True)
+            token_ids = np.concatenate([token_ids, extra])
+            prompt = self.tokenizer.decode(token_ids.tolist(), skip_special_tokens=True)
+        
         prompt_id = f"random_vocab_seed{self.seed_base + idx}_{self.target_tokens}tok"
         return prompt, prompt_id

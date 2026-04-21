@@ -21,6 +21,14 @@ import torch
 from core.context import HeadContext
 
 
+SVD_COMPUTE_DTYPE = torch.float32
+
+
+def _to_svd_tensor(matrix: torch.Tensor) -> torch.Tensor:
+    """Normalize matrices to CPU FP32 before SVD for numerical stability."""
+    return matrix.detach().cpu().to(dtype=SVD_COMPUTE_DTYPE)
+
+
 # ==============================================================================
 # Single SVD Entry Point
 # ==============================================================================
@@ -35,7 +43,7 @@ def _svdvals_cpu(matrix: torch.Tensor) -> torch.Tensor:
     Returns:
         1D float tensor of singular values in descending order.
     """
-    m = matrix.detach().cpu().float()
+    m = _to_svd_tensor(matrix)
     try:
         return torch.linalg.svdvals(m)
     except Exception:
@@ -277,7 +285,7 @@ def _top2_right_singular_vectors(matrix: torch.Tensor) -> torch.Tensor:
     Returns:
         Tensor of shape (2, d_model) — top-2 rows of V^T.
     """
-    m = matrix.detach().cpu().float()
+    m = _to_svd_tensor(matrix)
     try:
         _, _, Vt = torch.linalg.svd(m, full_matrices=False)
     except Exception:
@@ -331,8 +339,8 @@ def _get_cached_WqWk_svd(ctx: "HeadContext") -> Tuple[torch.Tensor, torch.Tensor
     between query and key projected channels, independently of the input.
     """
     if 'svd_WqWk' not in ctx.cache:
-        Wq = ctx.W_q.detach().cpu().float()  # [d_h, d_model]
-        Wk = ctx.W_k.detach().cpu().float()  # [d_h, d_model]
+        Wq = _to_svd_tensor(ctx.W_q)  # [d_h, d_model]
+        Wk = _to_svd_tensor(ctx.W_k)  # [d_h, d_model]
         M = Wq @ Wk.T                        # [d_h, d_h]
         try:
             U, S, Vh = torch.linalg.svd(M, full_matrices=False)
