@@ -1,0 +1,35 @@
+name: Sync to Kaggle Dataset
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'core/**'
+      - 'data/persistence.py'
+      - 'data/prompt_sources.py'
+      - 'config.py'
+      - 'batch_analysis.py'
+      - 'pipeline.py'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Upload to Kaggle
+        uses: jaimevalero/push-kaggle-dataset@v3.2
+        env:
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+        with:
+          id: "raffidag/sparse-attention-patterns"
+          title: "sparse-attention-patterns"
+          files: |
+            config.py
+            batch_analysis.py
+            pipeline.py
+            core
+            data/persistence.py
+            data/prompt_sources.py
+          is_public: false
