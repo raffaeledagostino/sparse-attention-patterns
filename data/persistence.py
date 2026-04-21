@@ -7,7 +7,7 @@ import pandas as pd
 
 def _strip_index_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Drop persisted index helper columns so they can be rebuilt deterministically."""
-    cols_to_drop = [col for col in ["run_idx", "sub_idx"] if col in df.columns]
+    cols_to_drop = [col for col in ["run_idx", "sub_idx", "q_k_pre_rope"] if col in df.columns]
     if cols_to_drop:
         return df.drop(columns=cols_to_drop)
     return df

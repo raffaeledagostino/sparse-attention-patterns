@@ -165,7 +165,6 @@ class LightweightAttentionAnalyzer:
                     output_hidden_states=True,
                     return_dict=True,
                 )
-            q_k_pre_rope = True
             print("[Analyzer] Q/K extraction mode: post-normalization, pre-RoPE (all models).")
         except Exception as e:
             raise RuntimeError(f"Forward pass failed: {e}")
@@ -272,7 +271,6 @@ class LightweightAttentionAnalyzer:
                         K=K,
                         attention_map=attention_map,
                         rmsnorm_gamma=qk_norm_gamma,
-                        q_k_pre_rope=q_k_pre_rope,  # flag di documentazione
                     )
 
                     features = get_all_features(ctx)
@@ -282,7 +280,6 @@ class LightweightAttentionAnalyzer:
                         "head_idx":      head_idx,
                         "prompt_len":    seq_len,
                         "prompt_source": prompt_source,
-                        "q_k_pre_rope":  q_k_pre_rope,
                     }
                     result.update(features)
                     results.append(result)
