@@ -126,103 +126,6 @@ class LightweightAttentionAnalyzer:
                 self.model.config._attn_implementation = ATTN_IMPLEMENTATION
         print(f"[Analyzer] Model loaded successfully. Using {self.model.config.num_hidden_layers} layers.")
     
-    def _is_qwen2(self) -> bool:
-        return getattr(self.model.config, "model_type", "").lower() == "qwen2"
-
-
-    def _forward_with_qwen2_rope_capture(self, input_ids):
-        """Same logic as Qwen3, but patches modeling_qwen2."""
-        import transformers.models.qwen2.modeling_qwen2 as qwen2_mod
-
-        q_captures, k_captures = {}, {}
-        call_counter = [0]
-        orig_rope = qwen2_mod.apply_rotary_pos_emb
-
-        def _capturing_rope(q, k, cos, sin, *args, **kwargs):
-            rotated_q, rotated_k = orig_rope(q, k, cos, sin, *args, **kwargs)
-            layer_idx = call_counter[0]
-            q_captures[layer_idx] = rotated_q.detach().squeeze(0).permute(1, 0, 2).cpu()
-            k_captures[layer_idx] = rotated_k.detach().squeeze(0).permute(1, 0, 2).cpu()
-            call_counter[0] += 1
-            return rotated_q, rotated_k
-
-        qwen2_mod.apply_rotary_pos_emb = _capturing_rope
-        try:
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids,
-                    output_attentions=True,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-        finally:
-            qwen2_mod.apply_rotary_pos_emb = orig_rope
-
-        return outputs, q_captures, k_captures
-
-
-
-
-    def _is_qwen3(self) -> bool:
-        """Detect Qwen3 architecture via model config."""
-        model_type = getattr(self.model.config, "model_type", "").lower()
-        return "qwen3" in model_type
-
-
-    def _forward_with_qwen3_rope_capture(
-        self,
-        input_ids: torch.Tensor,
-    ) -> Tuple[CausalLMOutputWithPast, Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
-        """
-        Forward pass for Qwen3 that intercepts Q and K post-QK-Norm and post-RoPE.
-
-        Monkey-patches `apply_rotary_pos_emb` in the qwen3 modeling module for
-        the duration of the forward pass, capturing the rotated tensors per layer.
-        The patch is ALWAYS restored in the finally block, even on exception.
-
-        Returns:
-            outputs:     Standard HuggingFace CausalLMOutputWithPast.
-            q_captures:  Dict[layer_idx -> Tensor(seq_len, num_q_heads, head_dim)]
-            k_captures:  Dict[layer_idx -> Tensor(seq_len, num_kv_heads, head_dim)]
-
-        Notes:
-            - apply_rotary_pos_emb is called exactly once per layer in Qwen3,
-            so call_counter maps 1-to-1 to layer index.
-            - Q and K are detached immediately to avoid retaining the graph.
-            - RoPE is NOT applied to the fallback pre-rope path (other models).
-        """
-        import transformers.models.qwen3.modeling_qwen3 as qwen3_mod
-
-        q_captures: Dict[int, torch.Tensor] = {}
-        k_captures: Dict[int, torch.Tensor] = {}
-        call_counter = [0]  # list for mutability inside closure
-
-        orig_rope = qwen3_mod.apply_rotary_pos_emb
-
-        def _capturing_rope(q, k, cos, sin, *args, **kwargs):
-            rotated_q, rotated_k = orig_rope(q, k, cos, sin, *args, **kwargs)
-            layer_idx = call_counter[0]
-            # shape from model: (batch=1, heads, seq_len, head_dim)
-            # → target shape: (seq_len, heads, head_dim)
-            q_captures[layer_idx] = rotated_q.detach().squeeze(0).permute(1, 0, 2).cpu()
-            k_captures[layer_idx] = rotated_k.detach().squeeze(0).permute(1, 0, 2).cpu()
-            call_counter[0] += 1
-            return rotated_q, rotated_k
-
-        qwen3_mod.apply_rotary_pos_emb = _capturing_rope
-        try:
-            with torch.no_grad():
-                outputs = self.model(
-                    input_ids,
-                    output_attentions=True,
-                    output_hidden_states=True,
-                    return_dict=True,
-                )
-        finally:
-            qwen3_mod.apply_rotary_pos_emb = orig_rope  # always restore
-
-        return outputs, q_captures, k_captures
-
     @staticmethod
     def _detect_device() -> str:
         """
@@ -251,24 +154,19 @@ class LightweightAttentionAnalyzer:
         print(f"[Analyzer] Tokenized to {seq_len} tokens.")
 
         # -------------------------------------------------------------------------
-        # Forward pass — branch on architecture
+        # Forward pass
         # -------------------------------------------------------------------------
         print(f"[Analyzer] Running forward pass...")
         try:
-            if self._is_qwen3():
-                outputs, q_post_rope, k_post_rope = self._forward_with_qwen3_rope_capture(input_ids)
-                q_k_pre_rope = False
-            elif self._is_qwen2():
-                outputs, q_post_rope, k_post_rope = self._forward_with_qwen2_rope_capture(input_ids)
-                q_k_pre_rope = False
-            else:
-                # Llama3, Mistral, ecc. — fallback
-                with torch.no_grad():
-                    outputs = self.model(input_ids, output_attentions=True,
-                                        output_hidden_states=True, return_dict=True)
-                q_post_rope, k_post_rope = {}, {}
-                q_k_pre_rope = True
-                print(f"[Analyzer] Non-Qwen3 model: Q/K will be pre-RoPE.")
+            with torch.no_grad():
+                outputs = self.model(
+                    input_ids,
+                    output_attentions=True,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+            q_k_pre_rope = True
+            print("[Analyzer] Q/K extraction mode: post-normalization, pre-RoPE (all models).")
         except Exception as e:
             raise RuntimeError(f"Forward pass failed: {e}")
 
@@ -323,34 +221,27 @@ class LightweightAttentionAnalyzer:
                 W_v_heads = W_v.reshape(num_kv_heads, head_dim, -1)
 
                 # ------------------------------------------------------------------
-                # Q/K source: post-RoPE if captured (Qwen3), else manual projection
-                # with QK-Norm applied where available.
+                # Q/K source: manual projection + QK-Norm (post-normalization,
+                # pre-RoPE) for every model.
                 # ------------------------------------------------------------------
-                if layer_idx in q_post_rope:
-                    # Qwen3: post-QK-Norm, post-RoPE — consistent with attention_map
-                    Q_all = q_post_rope[layer_idx].to(H_input.device)  # (seq, q_heads, head_dim)
-                    K_all = k_post_rope[layer_idx].to(H_input.device)  # (seq, kv_heads, head_dim)
-                else:
-                    # Fallback: manual projection + QK-Norm (no RoPE)
-                    Q_raw = H_input @ W_q.T
-                    if hasattr(attention_module, "q_proj") and attention_module.q_proj.bias is not None:
-                        Q_raw = Q_raw + attention_module.q_proj.bias
-                    Q_all = Q_raw.reshape(seq_len, num_q_heads, head_dim)
+                Q_raw = H_input @ W_q.T
+                if hasattr(attention_module, "q_proj") and attention_module.q_proj.bias is not None:
+                    Q_raw = Q_raw + attention_module.q_proj.bias
+                Q_all = Q_raw.reshape(seq_len, num_q_heads, head_dim)
 
-                    K_raw = H_input @ W_k.T
-                    if hasattr(attention_module, "k_proj") and attention_module.k_proj.bias is not None:
-                        K_raw = K_raw + attention_module.k_proj.bias
-                    K_all = K_raw.reshape(seq_len, num_kv_heads, head_dim)
+                K_raw = H_input @ W_k.T
+                if hasattr(attention_module, "k_proj") and attention_module.k_proj.bias is not None:
+                    K_raw = K_raw + attention_module.k_proj.bias
+                K_all = K_raw.reshape(seq_len, num_kv_heads, head_dim)
 
-                    # Apply QK-Norm if present (e.g. non-Qwen3 model with QK-Norm)
-                    if hasattr(attention_module, "q_norm") and attention_module.q_norm is not None:
-                        with torch.no_grad():
-                            Q_all = attention_module.q_norm(Q_all)
-                    if hasattr(attention_module, "k_norm") and attention_module.k_norm is not None:
-                        with torch.no_grad():
-                            K_all = attention_module.k_norm(K_all)
+                if hasattr(attention_module, "q_norm") and attention_module.q_norm is not None:
+                    with torch.no_grad():
+                        Q_all = attention_module.q_norm(Q_all)
+                if hasattr(attention_module, "k_norm") and attention_module.k_norm is not None:
+                    with torch.no_grad():
+                        K_all = attention_module.k_norm(K_all)
 
-                    del Q_raw, K_raw  # eager eviction
+                del Q_raw, K_raw  # eager eviction
 
                 qk_norm_gamma = None
                 if hasattr(attention_module, "q_norm") and \
@@ -406,9 +297,6 @@ class LightweightAttentionAnalyzer:
 
         finally:
             del hidden_states, attentions, outputs, input_ids, tokens
-            # Libera anche i capture (potrebbero essere grandi su seq_len lunghe)
-            q_post_rope.clear()
-            k_post_rope.clear()
             gc.collect()
             if self.device == "mps":   torch.mps.empty_cache()
             elif self.device == "cuda": torch.cuda.empty_cache()

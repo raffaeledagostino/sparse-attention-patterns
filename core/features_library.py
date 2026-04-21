@@ -441,6 +441,98 @@ def compute_rope_pair_var_Wk(ctx: "HeadContext") -> float:
         return np.nan
 
 
+def _max_normalized_channel_share(channel_magnitudes: torch.Tensor) -> float:
+    """
+    Maximum normalized channel share.
+
+    Given non-negative channel magnitudes c_k, compute:
+        p_k = c_k / sum_j c_j
+    and return max_k p_k.
+
+    Returns a scalar in [0, 1], where higher values indicate a dominant
+    channel concentrating most of the mass.
+    """
+    total = channel_magnitudes.sum()
+    if total <= 1e-12:
+        return np.nan
+    normalized = channel_magnitudes / total
+    return float(normalized.max().item())
+
+
+def _max_over_uniform_channel_share(channel_magnitudes: torch.Tensor) -> float:
+    """
+    Ratio between maximum normalized channel share and uniform share.
+
+    Given non-negative channel magnitudes c_k, compute:
+        p_k = c_k / sum_j c_j,  u = 1 / K
+    and return:
+        max_k p_k / u = K * max_k p_k
+
+    Returns 1.0 for a perfectly uniform distribution and grows as the top
+    channel becomes more dominant.
+    """
+    total = channel_magnitudes.sum()
+    if total <= 1e-12:
+        return np.nan
+    normalized = channel_magnitudes / total
+    K = normalized.shape[0]
+    if K == 0:
+        return np.nan
+    return float((normalized.max() * K).item())
+
+
+def compute_rope_pair_max_norm_Wq(ctx: "HeadContext") -> float:
+    """
+    Maximum normalized RoPE-pair channel share of W_q.
+
+    Measures dominance of a single channel after normalization.
+    """
+    try:
+        pair_norms = _rope_pair_norms(ctx.W_q)
+        return _max_normalized_channel_share(pair_norms)
+    except Exception as e:
+        print(f"Error in compute_rope_pair_max_norm_Wq: {e}")
+        return np.nan
+
+
+def compute_rope_pair_max_norm_Wk(ctx: "HeadContext") -> float:
+    """
+    Maximum normalized RoPE-pair channel share of W_k.
+
+    Measures dominance of a single channel after normalization.
+    """
+    try:
+        pair_norms = _rope_pair_norms(ctx.W_k)
+        return _max_normalized_channel_share(pair_norms)
+    except Exception as e:
+        print(f"Error in compute_rope_pair_max_norm_Wk: {e}")
+        return np.nan
+
+
+def compute_rope_pair_max_uniform_ratio_Wq(ctx: "HeadContext") -> float:
+    """
+    Ratio of max normalized RoPE-pair share to uniform share for W_q.
+    """
+    try:
+        pair_norms = _rope_pair_norms(ctx.W_q)
+        return _max_over_uniform_channel_share(pair_norms)
+    except Exception as e:
+        print(f"Error in compute_rope_pair_max_uniform_ratio_Wq: {e}")
+        return np.nan
+
+
+def compute_rope_pair_max_uniform_ratio_Wk(ctx: "HeadContext") -> float:
+    """
+    Ratio of max normalized RoPE-pair share to uniform share for W_k.
+    """
+    try:
+        pair_norms = _rope_pair_norms(ctx.W_k)
+        return _max_over_uniform_channel_share(pair_norms)
+    except Exception as e:
+        print(f"Error in compute_rope_pair_max_uniform_ratio_Wk: {e}")
+        return np.nan
+
+
 def compute_rope_freq_com_Wq(ctx: "HeadContext") -> float:
     """
     RoPE frequency center of mass of W_q.
@@ -482,32 +574,10 @@ def compute_rope_freq_com_Wk(ctx: "HeadContext") -> float:
 
 
 # ==============================================================================
-# Attention Map: Diagonal Pattern
-# ==============================================================================
-
-def _compute_diagonal_mass(ctx: "HeadContext", band_width: int) -> float:
-    """
-    Core implementation of diagonal mass computation.
-
-    Mathematical Definition:
-        DiagMass_w = sum(A[i,j] for |i-j| <= w//2) / sum(A)
-    """
-    A = ctx.attention_map
-    seq_len = A.shape[0]
-    half = band_width // 2
-    row = torch.arange(seq_len, device=A.device, dtype=torch.float32).unsqueeze(1)
-    col = torch.arange(seq_len, device=A.device, dtype=torch.float32).unsqueeze(0)
-    mask = (torch.abs(row - col) <= half).float()
-    total = A.sum()
-    if total <= 0:
-        return np.nan
-    return float((A * mask).sum() / total)
-
-# ==============================================================================
 # Attention Map: Diagonal and Shifted Patterns
 # ==============================================================================
 
-def _compute_shifted_diagonal_mass(ctx: "HeadContext", band_width: int, shift: int = 0) -> float:
+def _compute_diagonal_mass(ctx: "HeadContext", band_width: int, shift: int = 0) -> float:
     """
     Core implementation of shifted diagonal mass computation.
     
@@ -540,7 +610,7 @@ def _compute_shifted_diagonal_mass(ctx: "HeadContext", band_width: int, shift: i
 def compute_diagonal_mass_1(ctx: "HeadContext") -> float:
     """Fraction of attention mass on the exact main diagonal (self-attention)."""
     try:
-        return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=0)
+        return _compute_diagonal_mass(ctx, band_width=1, shift=0)
     except Exception as e:
         print(f"Error in compute_diagonal_mass_1: {e}")
         return np.nan
@@ -549,7 +619,7 @@ def compute_diagonal_mass_1(ctx: "HeadContext") -> float:
 def compute_diagonal_mass_5(ctx: "HeadContext") -> float:
     """Fraction of attention mass within a centered diagonal band of width 5."""
     try:
-        return _compute_shifted_diagonal_mass(ctx, band_width=5, shift=0)
+        return _compute_diagonal_mass(ctx, band_width=5, shift=0)
     except Exception as e:
         print(f"Error in compute_diagonal_mass_5: {e}")
         return np.nan
@@ -558,7 +628,7 @@ def compute_diagonal_mass_5(ctx: "HeadContext") -> float:
 def compute_shifted_diagonal_mass_1_shift_1(ctx: "HeadContext") -> float:
     """Fraction of attention mass on the exact previous token (shift=1)."""
     try:
-        return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=1)
+        return _compute_diagonal_mass(ctx, band_width=1, shift=1)
     except Exception as e:
         print(f"Error in compute_shifted_diagonal_mass_1_shift_1: {e}")
         return np.nan
@@ -567,7 +637,7 @@ def compute_shifted_diagonal_mass_1_shift_1(ctx: "HeadContext") -> float:
 def compute_shifted_diagonal_mass_1_shift_2(ctx: "HeadContext") -> float:
     """Fraction of attention mass exactly 2 tokens ago (shift=2)."""
     try:
-        return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=2)
+        return _compute_diagonal_mass(ctx, band_width=1, shift=2)
     except Exception as e:
         print(f"Error in compute_shifted_diagonal_mass_1_shift_2: {e}")
         return np.nan
@@ -575,7 +645,7 @@ def compute_shifted_diagonal_mass_1_shift_2(ctx: "HeadContext") -> float:
 def compute_shifted_diagonal_mass_1_shift_3(ctx: "HeadContext") -> float:
     """Fraction of attention mass exactly 3 tokens ago (shift=3)."""
     try:
-        return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=3)
+        return _compute_diagonal_mass(ctx, band_width=1, shift=3)
     except Exception as e:
         print(f"Error in compute_shifted_diagonal_mass_1_shift_3: {e}")
         return np.nan
@@ -583,45 +653,57 @@ def compute_shifted_diagonal_mass_1_shift_3(ctx: "HeadContext") -> float:
 def compute_shifted_diagonal_mass_1_shift_4(ctx: "HeadContext") -> float:
     """Fraction of attention mass exactly 4 tokens ago (shift=4)."""
     try:
-        return _compute_shifted_diagonal_mass(ctx, band_width=1, shift=4)
+        return _compute_diagonal_mass(ctx, band_width=1, shift=4)
     except Exception as e:
         print(f"Error in compute_shifted_diagonal_mass_1_shift_4: {e}")
         return np.nan
 
 # ==============================================================================
-# Attention Map: Per-Token Sink Mass
+# Attention Map: Sink Mass
 # ==============================================================================
 
-def _compute_single_token_sink_mass(ctx: "HeadContext", token_pos: int) -> float:
+def _compute_sink_mass(ctx: "HeadContext", token_pos: int = -1) -> float:
     """
-    Core implementation of per-token sink mass.
+    Core implementation of sink mass metrics.
 
-    Computes the average attention received by a single token at position
-    `token_pos`, averaged over all query positions that come strictly after it
-    (causal mask: i > token_pos only, excluding self-attention on the diagonal).
+    Computes per-column sink mass as the average attention received from future
+    query positions, normalized by each column's valid causal height:
+        Sink_j = mean(A[i, j] for i > j)
 
     Args:
-        token_pos: Absolute position of the candidate sink token (0-indexed).
-
-    Mathematical Definition:
-        Sink_j = mean(A[i, j] for i > j)  =  mean(A[j+1:, j])
+        token_pos:
+            - if >= 0, return Sink_{token_pos}
+            - if < 0, return max_j Sink_j
     """
     A = ctx.attention_map
     N = A.shape[0]
 
-    # Need at least one query position after token_pos
-    if N <= token_pos + 1:
+    if N < 2:
         return np.nan
 
-    # Column j, rows strictly below the diagonal (causal queries only)
-    sink_column = A[token_pos + 1:, token_pos]  # shape: (N - token_pos - 1,)
-    return float(sink_column.mean().item())
+    row = torch.arange(N, device=A.device).unsqueeze(1)
+    col = torch.arange(N, device=A.device).unsqueeze(0)
+    mask = (row > col)
+
+    counts = mask.sum(dim=0).float()
+    valid_cols = counts > 0
+    if not torch.any(valid_cols):
+        return np.nan
+
+    sink_per_col = (A * mask.float()).sum(dim=0) / counts.clamp(min=1.0)
+
+    if token_pos >= 0:
+        if token_pos >= N or not bool(valid_cols[token_pos].item()):
+            return np.nan
+        return float(sink_per_col[token_pos].item())
+
+    return float(sink_per_col[valid_cols].max().item())
 
 
 def compute_sink_mass_token_0(ctx: "HeadContext") -> float:
     """Average attention received by token 0 (BOS) from all subsequent tokens."""
     try:
-        return _compute_single_token_sink_mass(ctx, token_pos=0)
+        return _compute_sink_mass(ctx, token_pos=0)
     except Exception as e:
         print(f"Error in compute_sink_mass_token_0: {e}")
         return np.nan
@@ -630,7 +712,7 @@ def compute_sink_mass_token_0(ctx: "HeadContext") -> float:
 def compute_sink_mass_token_1(ctx: "HeadContext") -> float:
     """Average attention received by token 1 from all subsequent tokens."""
     try:
-        return _compute_single_token_sink_mass(ctx, token_pos=1)
+        return _compute_sink_mass(ctx, token_pos=1)
     except Exception as e:
         print(f"Error in compute_sink_mass_token_1: {e}")
         return np.nan
@@ -639,7 +721,7 @@ def compute_sink_mass_token_1(ctx: "HeadContext") -> float:
 def compute_sink_mass_token_2(ctx: "HeadContext") -> float:
     """Average attention received by token 2 from all subsequent tokens."""
     try:
-        return _compute_single_token_sink_mass(ctx, token_pos=2)
+        return _compute_sink_mass(ctx, token_pos=2)
     except Exception as e:
         print(f"Error in compute_sink_mass_token_2: {e}")
         return np.nan
@@ -648,17 +730,35 @@ def compute_sink_mass_token_2(ctx: "HeadContext") -> float:
 def compute_sink_mass_token_3(ctx: "HeadContext") -> float:
     """Average attention received by token 3 from all subsequent tokens."""
     try:
-        return _compute_single_token_sink_mass(ctx, token_pos=3)
+        return _compute_sink_mass(ctx, token_pos=3)
     except Exception as e:
         print(f"Error in compute_sink_mass_token_3: {e}")
         return np.nan
     
 def compute_sink_mass_token_4(ctx: "HeadContext") -> float:
-    """Average attention received by token 3 from all subsequent tokens."""
+    """Average attention received by token 4 from all subsequent tokens."""
     try:
-        return _compute_single_token_sink_mass(ctx, token_pos=4)
+        return _compute_sink_mass(ctx, token_pos=4)
     except Exception as e:
         print(f"Error in compute_sink_mass_token_4 {e}")
+        return np.nan
+
+
+def compute_sink_mass_max(ctx: "HeadContext") -> float:
+    """
+    Maximum per-column sink mass, normalized by each column's valid causal height.
+
+    For each key position j, compute the average attention mass received from all
+    future query positions (i > j):
+        Sink_j = mean(A[i, j] for i > j)
+
+    Then return the maximum over columns:
+        MaxSink = max_j Sink_j
+    """
+    try:
+        return _compute_sink_mass(ctx, token_pos=-1)
+    except Exception as e:
+        print(f"Error in compute_sink_mass_max: {e}")
         return np.nan
 
 
@@ -820,8 +920,15 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
 
     # --- RMSNorm and Channel Structure ---
     "rmsnorm_gamma_norm":           compute_rmsnorm_gamma_norm,
-    "rope_pair_var_Wq":          compute_rope_pair_var_Wq,
-    "rope_pair_var_Wk":          compute_rope_pair_var_Wk,
+
+    # Channel spread and dominance over RoPE pairs
+    "rope_pair_var_Wq":             compute_rope_pair_var_Wq,
+    "rope_pair_var_Wk":             compute_rope_pair_var_Wk,
+    "rope_pair_max_norm_Wq":        compute_rope_pair_max_norm_Wq,
+    "rope_pair_max_norm_Wk":        compute_rope_pair_max_norm_Wk,
+    "rope_pair_max_ratio_Wq":       compute_rope_pair_max_uniform_ratio_Wq,
+    "rope_pair_max_ratio_Wk":       compute_rope_pair_max_uniform_ratio_Wk,
+    
     "rope_freq_com_Wq":             compute_rope_freq_com_Wq,
     "rope_freq_com_Wk":             compute_rope_freq_com_Wk,
 
@@ -833,12 +940,13 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
     "diagonal_mass_1_shifted_3":    compute_shifted_diagonal_mass_1_shift_3,
     "diagonal_mass_1_shifted_4":    compute_shifted_diagonal_mass_1_shift_4,
 
-    # --- Attention Map: Sink (per-token) ---
+    # --- Attention Map: Sink ---
     "sink_mass_token_0":            compute_sink_mass_token_0,
     "sink_mass_token_1":            compute_sink_mass_token_1,
     "sink_mass_token_2":            compute_sink_mass_token_2,
     "sink_mass_token_3":            compute_sink_mass_token_3,
     "sink_mass_token_4":            compute_sink_mass_token_4,
+    "sink_mass_max":                compute_sink_mass_max,
 
     # --- Attention Map: Entropy and Variance ---
     "attention_entropy":            compute_attention_entropy,
