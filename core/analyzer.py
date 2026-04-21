@@ -219,6 +219,11 @@ class LightweightAttentionAnalyzer:
                     print(f"[Analyzer]   Skipping layer {layer_idx}: projections not found.")
                     continue
 
+                # Ensure projections are on the same device as hidden states.
+                W_q = W_q.to(H_input.device)
+                W_k = W_k.to(H_input.device)
+                W_v = W_v.to(H_input.device)
+
                 num_q_heads = getattr(attention_module, "num_heads",
                             getattr(attention_module, "num_attention_heads",
                                     self.model.config.num_attention_heads))
