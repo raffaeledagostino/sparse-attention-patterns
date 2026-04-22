@@ -15,6 +15,7 @@ Key Design Principles:
 """
 
 from typing import Callable, Dict, Tuple
+from flask import ctx
 import numpy as np
 import torch
 
@@ -407,13 +408,13 @@ def _rope_pair_norms(W: torch.Tensor) -> torch.Tensor:
         c_k = sqrt(||W[:, 2k]||^2 + ||W[:, 2k+1]||^2)
 
     Returns:
-        Tensor of shape (d_model // 2,) with one norm per frequency pair.
+        Tensor of shape (d_h // 2,) with one norm per frequency pair.
     """
     m = W.detach().cpu().float()
     
     row_norms_sq = (m ** 2).sum(dim=1)           # (d_h,)
     pair_norms_sq = row_norms_sq.view(-1, 2).sum(dim=1)  # (d_h//2,)
-    return pair_norms_sq.sqrt()                           # (d_model//2,)
+    return pair_norms_sq.sqrt()                           # (d_h//2,)
 
 
 def compute_rope_pair_var_Wq(ctx: "HeadContext") -> float:
@@ -785,12 +786,17 @@ def compute_attention_entropy(ctx: "HeadContext") -> float:
         H = -sum_{i,j} A[i,j] * log(A[i,j])  for A[i,j] > 0
     """
     try:
-        A = ctx.attention_map.flatten()
-        A = A[A > 1e-12]
-        if len(A) == 0:
-            return np.nan
-        entropy = -torch.sum(A * torch.log(A))
-        return float(entropy.item())
+        A = ctx.attention_map.float()
+        N = A.shape[0]
+        if N < 2: return np.nan
+        # Per ogni riga i, solo i primi i+1 elementi sono validi (causale)
+        row_entropies = []
+        for i in range(N):
+            row = A[i, :i+1] # Prendi solo i token validi
+            row = row[row > 1e-12]
+            if len(row) > 0:
+                row_entropies.append(-torch.sum(row * torch.log(row)).item())
+        return float(np.mean(row_entropies))
     except Exception as e:
         print(f"Error in compute_attention_entropy: {e}")
         return np.nan
@@ -808,7 +814,8 @@ def compute_attention_gini(ctx: "HeadContext") -> float:
         where w_i are sorted in ascending order.
     """
     try:
-        w, _ = torch.sort(ctx.attention_map.flatten().cpu().float())
+        mask = torch.tril(torch.ones_like(ctx.attention_map, dtype=torch.bool))
+        w, _ = torch.sort(ctx.attention_map[mask].flatten())
         n = w.shape[0]
         idx = torch.arange(1, n + 1, dtype=torch.float32)
         gini = (2.0 * (idx * w).sum() / (n * w.sum() + 1e-12)) - (n + 1.0) / n
@@ -857,15 +864,19 @@ def compute_look_back(ctx: "HeadContext") -> float:
     LB_norm = (1/N) * sum_i sum_j [(i-j) * A_ij].
 
     """
+    
     try:
-        A = ctx.attention_map
+        A = ctx.attention_map.float()
         N = A.shape[0]
-        if N < 2:
-            return np.nan
-        row = torch.arange(1, N + 1, dtype=torch.float32, device=A.device).unsqueeze(1)
-        col = torch.arange(1, N + 1, dtype=torch.float32, device=A.device).unsqueeze(0)
-        weights = (row - col).clamp(min=0) 
-        return float((A * weights).sum() / N)
+        row = torch.arange(N, dtype=torch.float32, device=A.device).unsqueeze(1)
+        col = torch.arange(N, dtype=torch.float32, device=A.device).unsqueeze(0)
+        distances = (row - col).clamp(min=0)
+        # Lookback normalizzato per riga
+        # max distanza per la riga i è i. Se i=0, distanza max è 1 (per evitare div/0)
+        max_distances = row.clamp(min=1) 
+        norm_distances = distances / max_distances
+        row_lookbacks = (A * norm_distances).sum(dim=1)
+        return float(row_lookbacks.mean().item())
     except Exception as e:
         print(f"Error in compute_look_back: {e}")
         return np.nan
