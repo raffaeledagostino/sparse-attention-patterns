@@ -276,18 +276,22 @@ class LightweightAttentionAnalyzer:
                     qk_norm_gamma = _f32(attention_module.q_norm.weight)
 
                 layer_attentions = attentions[layer_idx].squeeze(0)
+                layer_attentions_cpu = layer_attentions.detach().cpu().float()
 
                 # Reshape weight heads già su CPU float32
                 W_q_heads_cpu = W_q_cpu.reshape(num_q_heads,  head_dim, -1)
                 W_k_heads_cpu = W_k_cpu.reshape(num_kv_heads, head_dim, -1)
                 W_v_heads_cpu = W_v_cpu.reshape(num_kv_heads, head_dim, -1)
 
+                # Normalize Q_all and K_all to CPU float32 ONCE per layer
+                Q_all_cpu = Q_all.detach().cpu().float()
+                K_all_cpu = K_all.detach().cpu().float()
+
                 # ------------------------------------------------------------------
-                # PRE-COMPUTA SVD COSTOSE — una volta per layer, non per head
-                # H_input: (512, 896) — condiviso tra tutte le head
-                # A:       (512, 512) — diversa per head, ma cachata per head
+                # PRE-COMPUTE ALL SVDs — once per layer, inject into each head's cache
                 # ------------------------------------------------------------------
-                def _economy_svd(m: torch.Tensor):
+                
+                def _layer_economy_svd(m: torch.Tensor):
                     try:
                         return torch.linalg.svd(m, full_matrices=False)
                     except Exception:
@@ -304,22 +308,30 @@ class LightweightAttentionAnalyzer:
                         "r95": int((torch.cumsum(probs, 0) < 0.95).sum().item()) + 1,
                     }
 
-                # SVD di H — una per layer
-                _Uh, _Sh, _Vth = _economy_svd(H_cpu)
-                _layer_svd_cache = {
-                    "svd_H":       (_Uh, _Sh, _Vth),
-                    "rank_svd_H":  _rank_metrics(_Sh),
-                }
-
-                # SVD di A — una per head (512×512, la più costosa)
-                _attn_svd = {}
+                # Pre-compute SVDs once for the entire layer
+                # These will be injected into ctx.cache for each head
+                _svd_H = _layer_economy_svd(H_cpu)
+                _svd_Wq = _layer_economy_svd(W_q_cpu)
+                _svd_Wk = _layer_economy_svd(W_k_cpu)
+                _svd_Wv = _layer_economy_svd(W_v_cpu)
+                
+                # Pre-compute attention map SVDs per head
+                _svd_attn_per_head = {}
                 for _hi in head_indices:
-                    _A = layer_attentions[_hi].detach().cpu().float()
-                    _Ua, _Sa, _Vta = _economy_svd(_A)
-                    _attn_svd[_hi] = {
-                        "svd_A":      (_Ua, _Sa, _Vta),
-                        "rank_svd_A": _rank_metrics(_Sa),
-                    }
+                    _A = layer_attentions_cpu[_hi]
+                    _svd_attn_per_head[_hi] = _layer_economy_svd(_A)
+                
+                # Pre-inject static layer-level SVDs into a template cache
+                _layer_cache_template = {
+                    "svd_H":    _svd_H,
+                    "rank_svd_H": _rank_metrics(_svd_H[1]),
+                    "svd_Wq":   _svd_Wq,
+                    "rank_svd_Wq": _rank_metrics(_svd_Wq[1]),
+                    "svd_Wk":   _svd_Wk,
+                    "rank_svd_Wk": _rank_metrics(_svd_Wk[1]),
+                    "svd_Wv":   _svd_Wv,
+                    "rank_svd_Wv": _rank_metrics(_svd_Wv[1]),
+                }
 
                 # ------------------------------------------------------------------
                 # Loop head
@@ -328,25 +340,41 @@ class LightweightAttentionAnalyzer:
                     kv_head_idx = head_idx // kv_group_size if num_kv_heads < num_q_heads \
                                   else head_idx
                     kv_head_idx = min(kv_head_idx, num_kv_heads - 1)
+                    
+                    # Pre-compute per-head Q and K SVDs
+                    _Q_head = Q_all_cpu[:, head_idx, :]
+                    _K_head = K_all_cpu[:, kv_head_idx, :]
+                    _svd_Q_head = _layer_economy_svd(_Q_head)
+                    _svd_K_head = _layer_economy_svd(_K_head)
 
                     ctx = HeadContext(
                         model_name=self.model_name,
                         layer_idx=layer_idx,
                         head_idx=head_idx,
                         prompt_len=seq_len,
-                        H_input=H_cpu,                            # già CPU f32, condiviso
+                        H_input=H_cpu,
                         W_q=W_q_heads_cpu[head_idx],
                         W_k=W_k_heads_cpu[kv_head_idx],
                         W_v=W_v_heads_cpu[kv_head_idx],
-                        Q=_f32(Q_all[:, head_idx, :]),
-                        K=_f32(K_all[:, kv_head_idx, :]),
-                        attention_map=layer_attentions[head_idx].detach().cpu().float(),
+                        Q=_Q_head,
+                        K=_K_head,
+                        attention_map=layer_attentions_cpu[head_idx],
                         rmsnorm_gamma=qk_norm_gamma,
                     )
 
-                    # Inietta SVD pre-computate: cache già calda, zero ridondanza
-                    ctx.cache.update(_layer_svd_cache)   # H condiviso
-                    ctx.cache.update(_attn_svd[head_idx])  # A per questa head
+                    # Inject pre-computed layer-level SVDs (shared across all heads)
+                    ctx.cache.update(_layer_cache_template)
+                    
+                    # Inject per-head SVDs
+                    ctx.cache['svd_Q'] = _svd_Q_head
+                    ctx.cache['rank_svd_Q'] = _rank_metrics(_svd_Q_head[1])
+                    ctx.cache['svd_K'] = _svd_K_head
+                    ctx.cache['rank_svd_K'] = _rank_metrics(_svd_K_head[1])
+                    
+                    # Inject attention map SVD (pre-computed per head)
+                    _svd_A_head = _svd_attn_per_head[head_idx]
+                    ctx.cache['svd_A'] = _svd_A_head
+                    ctx.cache['rank_svd_A'] = _rank_metrics(_svd_A_head[1])
 
                     features = get_all_features(ctx)
                     result = {
@@ -362,7 +390,10 @@ class LightweightAttentionAnalyzer:
                     del ctx
 
                 del H_input, W_q, W_k, W_v, W_q_heads, W_k_heads, W_v_heads, \
-                    Q_all, K_all, layer_attentions, attention_module
+                    Q_all, K_all, layer_attentions, attention_module, \
+                    H_cpu, W_q_cpu, W_k_cpu, W_v_cpu, Q_all_cpu, K_all_cpu, layer_attentions_cpu, \
+                    W_q_heads_cpu, W_k_heads_cpu, W_v_heads_cpu, \
+                    _layer_cache_template, _svd_attn_per_head
                 gc.collect()
                 if self.device == "mps":   torch.mps.empty_cache()
                 elif self.device == "cuda": torch.cuda.empty_cache()
@@ -374,6 +405,8 @@ class LightweightAttentionAnalyzer:
             elif self.device == "cuda": torch.cuda.empty_cache()
 
         print(f"[Analyzer] Completed. Extracted {len(results)} head-level feature sets.")
+        assert len(results) == len(layer_indices) * len(head_indices), \
+            f"Expected {len(layer_indices)*len(head_indices)} rows, got {len(results)}"
         return results
     
     def _get_attention_module(self, layer_idx: int) -> Optional[Any]:
