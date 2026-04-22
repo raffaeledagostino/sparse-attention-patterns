@@ -6,6 +6,8 @@ from pathlib import Path
 # ── Model ────────────────────────────────────────────────────────────────
 MODEL_NAME = "Qwen/Qwen3-4B"
 MODEL_NAME_SMALL = "Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_NAME_SMALL_2 = "Qwen/Qwen3-0.6B"
+
 TRUST_REMOTE_CODE = True
 LOCAL_FILES_ONLY = False
 
