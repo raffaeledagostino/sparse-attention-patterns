@@ -22,141 +22,90 @@ import torch
 from core.context import HeadContext
 
 
+# ==============================================================================
+# SVD Infrastructure — single decomposition per matrix, shared across features
+# ==============================================================================
+
 SVD_COMPUTE_DTYPE = torch.float32
 
-
 def _to_svd_tensor(matrix: torch.Tensor) -> torch.Tensor:
-    """Normalize matrices to CPU FP32 before SVD for numerical stability."""
     return matrix.detach().cpu().to(dtype=SVD_COMPUTE_DTYPE)
 
-
-# ==============================================================================
-# Single SVD Entry Point
-# ==============================================================================
-
-def _svdvals_cpu(matrix: torch.Tensor) -> torch.Tensor:
+def _economy_svd(matrix: torch.Tensor):
     """
-    Compute singular values of a matrix on CPU (MPS-safe).
-
-    Args:
-        matrix: 2D float tensor of shape (m, n).
-
-    Returns:
-        1D float tensor of singular values in descending order.
+    Economy SVD on CPU float32. Returns (U, S, Vh) with full_matrices=False.
+    This is the ONE place where torch.linalg.svd is called.
+    full_matrices=False: for (m,n) with m<n returns U(m,m), S(m), Vh(m,n).
+    ~3x faster than full SVD for rectangular matrices like W_q (64x896).
     """
     m = _to_svd_tensor(matrix)
     try:
-        return torch.linalg.svdvals(m)
+        return torch.linalg.svd(m, full_matrices=False)
     except Exception:
-        _, s, _ = torch.svd(m)
-        return s
+        U, S, V = torch.svd(m, some=True)
+        return U, S, V.T
 
-
-def _compute_rank_metrics(matrix: torch.Tensor) -> Dict[str, float]:
+def _get_cached_svd(ctx: "HeadContext", key: str, matrix: torch.Tensor):
     """
-    Compute effective rank and R_95 from a 2D matrix via a single SVD call.
-
-    Effective rank is defined as exp(H(p)), where H is the Shannon entropy
-    of the normalized singular value distribution. R_95 is the minimum number
-    of singular values whose cumulative mass reaches 95% of the total.
-
-    Args:
-        matrix: 2D tensor of shape (m, n).
-
-    Returns:
-        dict with keys:
-            'effective_rank': float, exp(Shannon entropy of normalized singular values)
-            'r95':            int,   minimum k s.t. sum(s[:k]) / sum(s) >= 0.95
-    """
-    s = _svdvals_cpu(matrix)
-    total = s.sum() + 1e-12
-    probs = s / total
-
-    # Effective Rank: exp(H(p))
-    p_nz = probs[probs > 1e-12]
-    entropy = -torch.sum(p_nz * torch.log(p_nz))
-    effective_rank = float(torch.exp(entropy).item())
-
-    # R_95: smallest k such that cumulative mass >= 0.95
-    cumsum = torch.cumsum(probs, dim=0)
-    r95 = int((cumsum < 0.95).sum().item()) + 1
-
-    return {"effective_rank": effective_rank, "r95": r95}
-
-
-def _get_cached_rank(ctx: "HeadContext", key: str, matrix: torch.Tensor) -> Dict[str, float]:
-    """
-    Retrieve rank metrics from ctx.cache, computing them only once per (layer, head).
-
-    Args:
-        ctx:    HeadContext instance carrying the shared cache dict.
-        key:    Cache key string (e.g., 'rank_Q', 'rank_Wq').
-        matrix: The 2D tensor to decompose if the cache is cold.
-
-    Returns:
-        dict with 'effective_rank' and 'r95'.
+    Cache full economy SVD. Key convention: 'svd_Wq', 'svd_Wk', 'svd_Q', etc.
+    Compute once, reuse for both rank metrics AND alignment features.
     """
     if key not in ctx.cache:
-        ctx.cache[key] = _compute_rank_metrics(matrix)
+        ctx.cache[key] = _economy_svd(matrix)
     return ctx.cache[key]
+
+def _rank_metrics_from_S(S: torch.Tensor) -> Dict[str, float]:
+    """Compute effective_rank and r95 from precomputed singular values."""
+    total = S.sum() + 1e-12
+    probs = S / total
+    p_nz = probs[probs > 1e-12]
+    entropy = -torch.sum(p_nz * torch.log(p_nz))
+    cumsum = torch.cumsum(probs, dim=0)
+    return {
+        "effective_rank": float(torch.exp(entropy).item()),
+        "r95": int((cumsum < 0.95).sum().item()) + 1,
+    }
+
+def _get_cached_rank(ctx: "HeadContext", svd_key: str, matrix: torch.Tensor) -> Dict[str, float]:
+    """
+    Rank metrics from cached SVD. svd_key must match _get_cached_svd key.
+    rank_key is derived as 'rank_' + svd_key to avoid collision.
+    """
+    rank_key = "rank_" + svd_key
+    if rank_key not in ctx.cache:
+        _, S, _ = _get_cached_svd(ctx, svd_key, matrix)
+        ctx.cache[rank_key] = _rank_metrics_from_S(S)
+    return ctx.cache[rank_key]
 
 
 # ==============================================================================
 # Rank of Weight Matrices (W_q, W_k, W_v)
 # ==============================================================================
 
-def compute_effective_rank_Wq(ctx: "HeadContext") -> float:
-    """Effective rank of the weight matrix W_q for this head."""
-    try:
-        return _get_cached_rank(ctx, 'rank_Wq', ctx.W_q)['effective_rank']
-    except Exception as e:
-        print(f"Error in compute_effective_rank_Wq: {e}")
-        return np.nan
 
+def compute_effective_rank_Wq(ctx: "HeadContext") -> float:
+    try:    return _get_cached_rank(ctx, 'svd_Wq', ctx.W_q)['effective_rank']
+    except Exception as e: print(f"Error in compute_effective_rank_Wq: {e}"); return np.nan
 
 def compute_r95_Wq(ctx: "HeadContext") -> float:
-    """R_95% of the weight matrix W_q for this head."""
-    try:
-        return float(_get_cached_rank(ctx, 'rank_Wq', ctx.W_q)['r95'])
-    except Exception as e:
-        print(f"Error in compute_r95_Wq: {e}")
-        return np.nan
-
+    try:    return float(_get_cached_rank(ctx, 'svd_Wq', ctx.W_q)['r95'])
+    except Exception as e: print(f"Error in compute_r95_Wq: {e}"); return np.nan
 
 def compute_effective_rank_Wk(ctx: "HeadContext") -> float:
-    """Effective rank of the weight matrix W_k for this head."""
-    try:
-        return _get_cached_rank(ctx, 'rank_Wk', ctx.W_k)['effective_rank']
-    except Exception as e:
-        print(f"Error in compute_effective_rank_Wk: {e}")
-        return np.nan
-
+    try:    return _get_cached_rank(ctx, 'svd_Wk', ctx.W_k)['effective_rank']
+    except Exception as e: print(f"Error in compute_effective_rank_Wk: {e}"); return np.nan
 
 def compute_r95_Wk(ctx: "HeadContext") -> float:
-    """R_95% of the weight matrix W_k for this head."""
-    try:
-        return float(_get_cached_rank(ctx, 'rank_Wk', ctx.W_k)['r95'])
-    except Exception as e:
-        print(f"Error in compute_r95_Wk: {e}")
-        return np.nan
-
+    try:    return float(_get_cached_rank(ctx, 'svd_Wk', ctx.W_k)['r95'])
+    except Exception as e: print(f"Error in compute_r95_Wk: {e}"); return np.nan
 
 def compute_effective_rank_Wv(ctx: "HeadContext") -> float:
-    """Effective rank of the weight matrix W_v for this head."""
-    try:
-        return _get_cached_rank(ctx, 'rank_Wv', ctx.W_v)['effective_rank']
-    except Exception as e:
-        print(f"Error in compute_effective_rank_Wv: {e}")
-        return np.nan
-
+    try:    return _get_cached_rank(ctx, 'svd_Wv', ctx.W_v)['effective_rank']
+    except Exception as e: print(f"Error in compute_effective_rank_Wv: {e}"); return np.nan
 
 def compute_r95_Wv(ctx: "HeadContext") -> float:
-    """R_95% of the weight matrix W_v for this head."""
-    try:
-        return float(_get_cached_rank(ctx, 'rank_Wv', ctx.W_v)['r95'])
-    except Exception as e:
-        print(f"Error in compute_r95_Wv: {e}")
-        return np.nan
+    try:    return float(_get_cached_rank(ctx, 'svd_Wv', ctx.W_v)['r95'])
+    except Exception as e: print(f"Error in compute_r95_Wv: {e}"); return np.nan
 
 
 # ==============================================================================
@@ -164,26 +113,12 @@ def compute_r95_Wv(ctx: "HeadContext") -> float:
 # ==============================================================================
 
 def compute_effective_rank_H(ctx: "HeadContext") -> float:
-    """
-    Effective rank of the input hidden state matrix H.
-
-    H has shape (seq_len, d_model) and is shared across all heads in the same
-    layer. The cache ensures the SVD is computed only once per layer.
-    """
-    try:
-        return _get_cached_rank(ctx, 'rank_H', ctx.H_input)['effective_rank']
-    except Exception as e:
-        print(f"Error in compute_effective_rank_H: {e}")
-        return np.nan
-
+    try:    return _get_cached_rank(ctx, 'svd_H', ctx.H_input)['effective_rank']
+    except Exception as e: print(f"Error in compute_effective_rank_H: {e}"); return np.nan
 
 def compute_r95_H(ctx: "HeadContext") -> float:
-    """R_95% of the input hidden state matrix H."""
-    try:
-        return float(_get_cached_rank(ctx, 'rank_H', ctx.H_input)['r95'])
-    except Exception as e:
-        print(f"Error in compute_r95_H: {e}")
-        return np.nan
+    try:    return float(_get_cached_rank(ctx, 'svd_H', ctx.H_input)['r95'])
+    except Exception as e: print(f"Error in compute_r95_H: {e}"); return np.nan
 
 
 # ==============================================================================
@@ -191,45 +126,20 @@ def compute_r95_H(ctx: "HeadContext") -> float:
 # ==============================================================================
 
 def compute_effective_rank_Q(ctx: "HeadContext") -> float:
-    """
-    Effective rank of the projected Query matrix Q = H @ W_q^T.
-
-    Mathematical Definition:
-        s = SVD(Q),  p_i = s_i / sum(s)
-        effective_rank = exp(-sum(p_i * log(p_i)))
-    """
-    try:
-        return _get_cached_rank(ctx, 'rank_Q', ctx.Q)['effective_rank']
-    except Exception as e:
-        print(f"Error in compute_effective_rank_Q: {e}")
-        return np.nan
-
+    try:    return _get_cached_rank(ctx, 'svd_Q', ctx.Q)['effective_rank']
+    except Exception as e: print(f"Error in compute_effective_rank_Q: {e}"); return np.nan
 
 def compute_r95_Q(ctx: "HeadContext") -> float:
-    """R_95% of the projected Query matrix Q."""
-    try:
-        return float(_get_cached_rank(ctx, 'rank_Q', ctx.Q)['r95'])
-    except Exception as e:
-        print(f"Error in compute_r95_Q: {e}")
-        return np.nan
-
+    try:    return float(_get_cached_rank(ctx, 'svd_Q', ctx.Q)['r95'])
+    except Exception as e: print(f"Error in compute_r95_Q: {e}"); return np.nan
 
 def compute_effective_rank_K(ctx: "HeadContext") -> float:
-    """Effective rank of the projected Key matrix K = H @ W_k^T."""
-    try:
-        return _get_cached_rank(ctx, 'rank_K', ctx.K)['effective_rank']
-    except Exception as e:
-        print(f"Error in compute_effective_rank_K: {e}")
-        return np.nan
-
+    try:    return _get_cached_rank(ctx, 'svd_K', ctx.K)['effective_rank']
+    except Exception as e: print(f"Error in compute_effective_rank_K: {e}"); return np.nan
 
 def compute_r95_K(ctx: "HeadContext") -> float:
-    """R_95% of the projected Key matrix K."""
-    try:
-        return float(_get_cached_rank(ctx, 'rank_K', ctx.K)['r95'])
-    except Exception as e:
-        print(f"Error in compute_r95_K: {e}")
-        return np.nan
+    try:    return float(_get_cached_rank(ctx, 'svd_K', ctx.K)['r95'])
+    except Exception as e: print(f"Error in compute_r95_K: {e}"); return np.nan
 
 
 # ==============================================================================
@@ -277,78 +187,35 @@ def compute_k_sim_consecutive(ctx: "HeadContext") -> float:
 # ==============================================================================
 # SVD Alignment (H vs W_q, H vs W_k)
 # ==============================================================================
-def _top2_right_singular_vectors(matrix: torch.Tensor) -> torch.Tensor:
-    """
-    Return the top-2 right singular vectors of a matrix.
-    Both H and W live in R^{d_model} as their column space,
-    so right singular vectors are geometrically comparable across matrices.
-
-    Returns:
-        Tensor of shape (2, d_model) — top-2 rows of V^T.
-    """
-    m = _to_svd_tensor(matrix)
-    try:
-        _, _, Vt = torch.linalg.svd(m, full_matrices=False)
-    except Exception:
-        _, _, Vt = torch.svd(m)
-        Vt = Vt.T
-    return Vt[:2]  # shape: (2, d_model)
-
-def _principal_angle_alignment(V1: torch.Tensor, V2: torch.Tensor) -> float:
-    """
-    Mean cosine of principal angles between subspaces spanned by rows of V1, V2.
-    V1: (k, d), V2: (k, d) — rows are orthonormal (from SVD).
-    sigma_i(V1 @ V2.T) = cos(theta_i), i=1..k.
-    1.0 = identical subspaces, 0.0 = orthogonal subspaces.
-    """
-    G = V1.cpu() @ V2.cpu().T          # (k, k) Gram matrix
-    cos_angles = torch.linalg.svdvals(G.float())   # [0, 1]
-    return float(cos_angles.mean().item())
 
 def compute_svd_alignment_H_Wq(ctx: "HeadContext") -> float:
-    """
-    Mean cosine of principal angles between the top-2 right singular
-    subspaces of H and W_q in the shared input space R^{d_model}.
-    Uses principal angles (optimal matching) instead of positional pairing.
-    """
+    """Riusa SVD già in cache — nessuna decomposizione aggiuntiva."""
     try:
-        V_H  = _top2_right_singular_vectors(ctx.H_input)  # (2, d_model)
-        V_Wq = _top2_right_singular_vectors(ctx.W_q)      # (2, d_model)
-        return _principal_angle_alignment(V_H, V_Wq)
+        _, _, Vh_H  = _get_cached_svd(ctx, 'svd_H',  ctx.H_input)
+        _, _, Vh_Wq = _get_cached_svd(ctx, 'svd_Wq', ctx.W_q)
+        G = Vh_H[:2].cpu() @ Vh_Wq[:2].cpu().T
+        return float(torch.linalg.svdvals(G.float()).mean().item())
     except Exception as e:
-        print(f"Error in compute_svd_alignment_H_Wq: {e}")
-        return np.nan
+        print(f"Error in compute_svd_alignment_H_Wq: {e}"); return np.nan
 
 def compute_svd_alignment_H_Wk(ctx: "HeadContext") -> float:
-    """
-    Mean cosine of principal angles between the top-2 right singular
-    subspaces of H and W_k in the shared input space R^{d_model}.
-    """
     try:
-        V_H  = _top2_right_singular_vectors(ctx.H_input)  # (2, d_model)
-        V_Wk = _top2_right_singular_vectors(ctx.W_k)      # (2, d_model)
-        return _principal_angle_alignment(V_H, V_Wk)
+        _, _, Vh_H  = _get_cached_svd(ctx, 'svd_H',  ctx.H_input)
+        _, _, Vh_Wk = _get_cached_svd(ctx, 'svd_Wk', ctx.W_k)
+        G = Vh_H[:2].cpu() @ Vh_Wk[:2].cpu().T
+        return float(torch.linalg.svdvals(G.float()).mean().item())
     except Exception as e:
-        print(f"Error in compute_svd_alignment_H_Wk: {e}")
-        return np.nan
+        print(f"Error in compute_svd_alignment_H_Wk: {e}"); return np.nan
 
 def _get_cached_WqWk_svd(ctx: "HeadContext") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Cached full SVD of the head interaction matrix M = W_q @ W_k^T in R^{d_h x d_h}.
-
-    M_{ij} = (e_i^T W_q)(W_k^T e_j) captures the bilinear interaction
-    between query and key projected channels, independently of the input.
+    SVD of M = W_q @ W_k^T in R^{d_h x d_h}.
     """
     if 'svd_WqWk' not in ctx.cache:
-        Wq = _to_svd_tensor(ctx.W_q)  # [d_h, d_model]
-        Wk = _to_svd_tensor(ctx.W_k)  # [d_h, d_model]
-        M = Wq @ Wk.T                        # [d_h, d_h]
-        try:
-            U, S, Vh = torch.linalg.svd(M, full_matrices=False)
-        except Exception:
-            U, S, V = torch.svd(M)
-            Vh = V.T   # normalizza subito alla convenzione linalg
-        ctx.cache['svd_WqWk'] = (U, S, Vh)
+        Wq = _to_svd_tensor(ctx.W_q)
+        Wk = _to_svd_tensor(ctx.W_k)
+        M  = Wq @ Wk.T                    
+        ctx.cache['svd_WqWk'] = _economy_svd(M)   
     return ctx.cache['svd_WqWk']
 
 
@@ -777,26 +644,20 @@ def compute_sink_mass_max(ctx: "HeadContext") -> float:
 
 def compute_attention_entropy(ctx: "HeadContext") -> float:
     """
-    Shannon entropy of the full post-softmax attention map.
-
-    High entropy indicates dispersed (dense) attention.
-    Low entropy indicates concentrated (sparse) attention.
-
-    Mathematical Definition:
-        H = -sum_{i,j} A[i,j] * log(A[i,j])  for A[i,j] > 0
+    Shannon entropy of causal attention rows — vectorized.
+    H = mean_i( -sum_j A[i,j] * log(A[i,j]) )  for j <= i only.
     """
     try:
         A = ctx.attention_map.float()
         N = A.shape[0]
-        if N < 2: return np.nan
-        # Per ogni riga i, solo i primi i+1 elementi sono validi (causale)
-        row_entropies = []
-        for i in range(N):
-            row = A[i, :i+1] # Prendi solo i token validi
-            row = row[row > 1e-12]
-            if len(row) > 0:
-                row_entropies.append(-torch.sum(row * torch.log(row)).item())
-        return float(np.mean(row_entropies))
+        if N < 2:
+            return np.nan
+        mask = torch.tril(torch.ones(N, N, dtype=torch.bool, device=A.device))
+        A_masked = (A * mask).clamp(min=1e-12)
+        # log(clamp) su celle fuori dalla maschera produce valori negativi
+        # ma li azzeriamo moltiplicando di nuovo per mask
+        row_entropies = -(A * torch.log(A_masked) * mask).sum(dim=1)  # [N]
+        return float(row_entropies.mean().item())
     except Exception as e:
         print(f"Error in compute_attention_entropy: {e}")
         return np.nan
@@ -887,21 +748,12 @@ def compute_look_back(ctx: "HeadContext") -> float:
 # ==============================================================================
 
 def compute_effective_rank_A(ctx: "HeadContext") -> float:
-    """Effective rank of the post-softmax attention matrix A."""
-    try:
-        return _get_cached_rank(ctx, 'rank_A', ctx.attention_map)['effective_rank']
-    except Exception as e:
-        print(f"Error in compute_effective_rank_A: {e}")
-        return np.nan
-
+    try:    return _get_cached_rank(ctx, 'svd_A', ctx.attention_map)['effective_rank']
+    except Exception as e: print(f"Error in compute_effective_rank_A: {e}"); return np.nan
 
 def compute_r95_A(ctx: "HeadContext") -> float:
-    """R_95% of the post-softmax attention matrix A."""
-    try:
-        return float(_get_cached_rank(ctx, 'rank_A', ctx.attention_map)['r95'])
-    except Exception as e:
-        print(f"Error in compute_r95_A: {e}")
-        return np.nan
+    try:    return float(_get_cached_rank(ctx, 'svd_A', ctx.attention_map)['r95'])
+    except Exception as e: print(f"Error in compute_r95_A: {e}"); return np.nan
 
 
 # ==============================================================================
