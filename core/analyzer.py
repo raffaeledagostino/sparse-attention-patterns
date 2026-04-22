@@ -242,16 +242,22 @@ class LightweightAttentionAnalyzer:
                 # Q/K source: manual projection + QK-Norm (post-normalization,
                 # pre-RoPE) for every model.
                 # ------------------------------------------------------------------
+                _f32 = lambda t: t.detach().cpu().float() if t is not None else None
+
+                H_cpu   = _f32(H_input)                        # (512, 896) — condiviso
+                W_q_cpu = _f32(W_q)                            # (896, 896)
+                W_k_cpu = _f32(W_k)                            # (128, 896) GQA
+                W_v_cpu = _f32(W_v)
+
+                # Q/K projection + QK-Norm (invariato, ma su device del modello)
                 Q_raw = H_input @ W_q.T
                 if hasattr(attention_module, "q_proj") and attention_module.q_proj.bias is not None:
-                    q_bias = attention_module.q_proj.bias.to(H_input.device)
-                    Q_raw = Q_raw + q_bias
+                    Q_raw = Q_raw + attention_module.q_proj.bias.to(H_input.device)
                 Q_all = Q_raw.reshape(seq_len, num_q_heads, head_dim)
 
                 K_raw = H_input @ W_k.T
                 if hasattr(attention_module, "k_proj") and attention_module.k_proj.bias is not None:
-                    k_bias = attention_module.k_proj.bias.to(H_input.device)
-                    K_raw = K_raw + k_bias
+                    K_raw = K_raw + attention_module.k_proj.bias.to(H_input.device)
                 K_all = K_raw.reshape(seq_len, num_kv_heads, head_dim)
 
                 if hasattr(attention_module, "q_norm") and attention_module.q_norm is not None:
@@ -261,38 +267,86 @@ class LightweightAttentionAnalyzer:
                     with torch.no_grad():
                         K_all = attention_module.k_norm(K_all)
 
-                del Q_raw, K_raw  # eager eviction
+                del Q_raw, K_raw
 
+                # QK-norm gamma
                 qk_norm_gamma = None
                 if hasattr(attention_module, "q_norm") and \
-                hasattr(attention_module.q_norm, "weight"):
-                    qk_norm_gamma = attention_module.q_norm.weight.detach()
+                        hasattr(attention_module.q_norm, "weight"):
+                    qk_norm_gamma = _f32(attention_module.q_norm.weight)
 
                 layer_attentions = attentions[layer_idx].squeeze(0)
 
+                # Reshape weight heads già su CPU float32
+                W_q_heads_cpu = W_q_cpu.reshape(num_q_heads,  head_dim, -1)
+                W_k_heads_cpu = W_k_cpu.reshape(num_kv_heads, head_dim, -1)
+                W_v_heads_cpu = W_v_cpu.reshape(num_kv_heads, head_dim, -1)
+
+                # ------------------------------------------------------------------
+                # PRE-COMPUTA SVD COSTOSE — una volta per layer, non per head
+                # H_input: (512, 896) — condiviso tra tutte le head
+                # A:       (512, 512) — diversa per head, ma cachata per head
+                # ------------------------------------------------------------------
+                def _economy_svd(m: torch.Tensor):
+                    try:
+                        return torch.linalg.svd(m, full_matrices=False)
+                    except Exception:
+                        U, S, V = torch.svd(m, some=True)
+                        return U, S, V.T
+
+                def _rank_metrics(S: torch.Tensor):
+                    total = S.sum() + 1e-12
+                    probs = S / total
+                    p_nz  = probs[probs > 1e-12]
+                    return {
+                        "effective_rank": float(torch.exp(
+                            -torch.sum(p_nz * torch.log(p_nz))).item()),
+                        "r95": int((torch.cumsum(probs, 0) < 0.95).sum().item()) + 1,
+                    }
+
+                # SVD di H — una per layer
+                _Uh, _Sh, _Vth = _economy_svd(H_cpu)
+                _layer_svd_cache = {
+                    "svd_H":       (_Uh, _Sh, _Vth),
+                    "rank_svd_H":  _rank_metrics(_Sh),
+                }
+
+                # SVD di A — una per head (512×512, la più costosa)
+                _attn_svd = {}
+                for _hi in head_indices:
+                    _A = layer_attentions[_hi].detach().cpu().float()
+                    _Ua, _Sa, _Vta = _economy_svd(_A)
+                    _attn_svd[_hi] = {
+                        "svd_A":      (_Ua, _Sa, _Vta),
+                        "rank_svd_A": _rank_metrics(_Sa),
+                    }
+
+                # ------------------------------------------------------------------
+                # Loop head
+                # ------------------------------------------------------------------
                 for head_idx in head_indices:
                     kv_head_idx = head_idx // kv_group_size if num_kv_heads < num_q_heads \
-                                else head_idx
+                                  else head_idx
                     kv_head_idx = min(kv_head_idx, num_kv_heads - 1)
-
-                    Q = Q_all[:, head_idx, :]
-                    K = K_all[:, kv_head_idx, :]
-                    attention_map = layer_attentions[head_idx, :, :]
 
                     ctx = HeadContext(
                         model_name=self.model_name,
                         layer_idx=layer_idx,
                         head_idx=head_idx,
                         prompt_len=seq_len,
-                        H_input=H_input,
-                        W_q=W_q_heads[head_idx],
-                        W_k=W_k_heads[kv_head_idx],
-                        W_v=W_v_heads[kv_head_idx],
-                        Q=Q,
-                        K=K,
-                        attention_map=attention_map,
+                        H_input=H_cpu,                            # già CPU f32, condiviso
+                        W_q=W_q_heads_cpu[head_idx],
+                        W_k=W_k_heads_cpu[kv_head_idx],
+                        W_v=W_v_heads_cpu[kv_head_idx],
+                        Q=_f32(Q_all[:, head_idx, :]),
+                        K=_f32(K_all[:, kv_head_idx, :]),
+                        attention_map=layer_attentions[head_idx].detach().cpu().float(),
                         rmsnorm_gamma=qk_norm_gamma,
                     )
+
+                    # Inietta SVD pre-computate: cache già calda, zero ridondanza
+                    ctx.cache.update(_layer_svd_cache)   # H condiviso
+                    ctx.cache.update(_attn_svd[head_idx])  # A per questa head
 
                     features = get_all_features(ctx)
                     result = {
@@ -305,7 +359,7 @@ class LightweightAttentionAnalyzer:
                     result.update(features)
                     results.append(result)
 
-                    del Q, K, ctx
+                    del ctx
 
                 del H_input, W_q, W_k, W_v, W_q_heads, W_k_heads, W_v_heads, \
                     Q_all, K_all, layer_attentions, attention_module
