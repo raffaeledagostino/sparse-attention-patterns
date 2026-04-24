@@ -36,6 +36,6 @@ PROMPT_PREVIEW_CHARS = 100
 
 
 # ── Persistence ──────────────────────────────────────────────────────────
-OUTPUT_PATH = Path("data/attention_features.parquet")
+OUTPUT_PATH = Path("data/Qwen3_4B_512tok.parquet")
 PRIMARY_KEY = ["model_name", "prompt_id", "layer_idx", "head_idx"]
 # trigger test
