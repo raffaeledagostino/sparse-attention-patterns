@@ -275,6 +275,12 @@ class LightweightAttentionAnalyzer:
                         hasattr(attention_module.q_norm, "weight"):
                     qk_norm_gamma = _f32(attention_module.q_norm.weight)
 
+                rope_theta = getattr(
+                    getattr(attention_module, "rotary_emb", None),
+                    "base",
+                    getattr(self.model.config, "rope_theta", 100000.0),
+                )
+
                 layer_attentions = attentions[layer_idx].squeeze(0)
                 layer_attentions_cpu = layer_attentions.detach().cpu().float()
 
@@ -359,6 +365,7 @@ class LightweightAttentionAnalyzer:
                         Q=_Q_head,
                         K=_K_head,
                         attention_map=layer_attentions_cpu[head_idx],
+                        rope_theta=float(rope_theta),
                         rmsnorm_gamma=qk_norm_gamma,
                     )
 
