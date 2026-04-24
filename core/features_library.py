@@ -227,31 +227,29 @@ def compute_svd_alignment_H_Wk(ctx: "HeadContext") -> float:
         return float(torch.linalg.svdvals(G.float()).mean().item())
     except Exception as e:
         print(f"Error in compute_svd_alignment_H_Wk: {e}"); return np.nan
-
+    
 def _compute_WqRWk_alignment(ctx: "HeadContext", delta: int) -> float:
-    """
-    Singular-value-weighted cosine similarity of M(Δ) = W_q R_{Δθ} W_k^T.
-
-    rho(Δ) = Σ_n (σ_n / Σ_m σ_m) * <u_n, v_n>
-
-    delta=0 -> R=I -> equivalent to the old W_q/W_k alignment.
-    delta>0 measures intrinsic grouping tendency for tokens delta steps apart.
-    Input-independent: computed once per head from weight matrices only.
-    """
     try:
-        Wq, Wk = ctx.W_q, ctx.W_k
-        d_head = Wq.shape[0]
-        R = build_rope_rotation(delta, d_head, ctx.rope_theta).to(Wq.device, Wq.dtype)
-        M = Wq @ R @ Wk.T
-        U, S, Vh = _economy_svd(M)
-        V = Vh.T
-        cos_sim = (U * V).sum(dim=0)
-        weights = S / (S.sum() + 1e-12)
+        cache_key = f"svd_WqRWk_delta_{delta}"
+        if cache_key not in ctx.cache:
+            Wq, Wk = ctx.W_q, ctx.W_k          # [d_head, d_model]
+            d_head  = Wq.shape[0]
+            R  = build_rope_rotation(delta, d_head, ctx.rope_theta).to(Wq.device, Wq.dtype)
+            
+            # M = Wq Wk^T R^T  — dimensioni: [d_h,d_m] @ [d_m,d_h] @ [d_h,d_h] = [d_h,d_h] ✓
+            # Equivalente a score = q^T R k = (Wq x)^T R (Wk x) con R = R_i^T R_j
+            M = Wq @ Wk.T @ R.T
+
+            ctx.cache[cache_key] = _economy_svd(M)
+
+        U, S, Vh = ctx.cache[cache_key]
+        V        = Vh.T
+        cos_sim  = (U * V).sum(dim=0)
+        weights  = S / (S.sum() + 1e-12)
         return float((weights * cos_sim).sum().item())
     except Exception as e:
         print(f"Error in _compute_WqRWk_alignment delta={delta}: {e}")
         return np.nan
-
 
 def compute_WqRWk_alignment_delta_0(ctx: "HeadContext") -> float:
     """QK alignment, Δ=0 (R=I). Equivalent to the old W_q/W_k alignment."""
