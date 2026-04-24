@@ -14,9 +14,7 @@ Key Design Principles:
   - FEATURE_REGISTRY is the single source of truth: add a function here only.
 """
 
-import math
 from typing import Callable, Dict, Tuple
-from flask import ctx
 import numpy as np
 import torch
 
@@ -198,15 +196,17 @@ def build_rope_rotation(delta: int, d_head: int, theta_base: float = 10000.0) ->
     The matrix acts on 2D subspaces (pairs of dimensions). delta=0 yields the
     identity matrix.
     """
-    R = torch.eye(d_head)
-    for k in range(d_head // 2):
-        theta_k = theta_base ** (-2 * k / d_head)
-        angle = theta_k * delta
-        c, s = math.cos(angle), math.sin(angle)
-        R[2 * k, 2 * k] = c
-        R[2 * k, 2 * k + 1] = -s
-        R[2 * k + 1, 2 * k] = s
-        R[2 * k + 1, 2 * k + 1] = c
+    half = d_head // 2
+    k = torch.arange(half, dtype=torch.float32)
+    angles = (theta_base ** (-2.0 * k / d_head)) * delta
+    cos_a, sin_a = angles.cos(), angles.sin()
+
+    idx = k.long() * 2
+    R = torch.zeros(d_head, d_head)
+    R[idx, idx] = cos_a
+    R[idx, idx + 1] = -sin_a
+    R[idx + 1, idx] = sin_a
+    R[idx + 1, idx + 1] = cos_a
     return R
 
 def compute_svd_alignment_H_Wq(ctx: "HeadContext") -> float:
@@ -232,14 +232,12 @@ def _compute_WqRWk_alignment(ctx: "HeadContext", delta: int) -> float:
     try:
         cache_key = f"svd_WqRWk_delta_{delta}"
         if cache_key not in ctx.cache:
-            Wq, Wk = ctx.W_q, ctx.W_k          # [d_head, d_model]
-            d_head  = Wq.shape[0]
-            R  = build_rope_rotation(delta, d_head, ctx.rope_theta).to(Wq.device, Wq.dtype)
-            
-            # M = Wq Wk^T R^T  — dimensioni: [d_h,d_m] @ [d_m,d_h] @ [d_h,d_h] = [d_h,d_h] ✓
-            # Equivalente a score = q^T R k = (Wq x)^T R (Wk x) con R = R_i^T R_j
-            M = Wq @ Wk.T @ R.T
-
+            if "WqWk" not in ctx.cache:
+                ctx.cache["WqWk"] = _to_svd_tensor(ctx.W_q) @ _to_svd_tensor(ctx.W_k).T
+            WqWk = ctx.cache["WqWk"]
+            d_head = WqWk.shape[0]
+            R = build_rope_rotation(delta, d_head, ctx.rope_theta).to(WqWk.dtype)
+            M = WqWk @ R.T
             ctx.cache[cache_key] = _economy_svd(M)
 
         U, S, Vh = ctx.cache[cache_key]
@@ -336,6 +334,13 @@ def _rope_pair_norms(W: torch.Tensor) -> torch.Tensor:
     return pair_norms_sq.sqrt()                           # (d_h//2,)
 
 
+def _get_cached_rope_pair_norms(ctx: "HeadContext", key: str, W: torch.Tensor) -> torch.Tensor:
+    """Cache RoPE pair norms — called up to 4 times per W per head."""
+    if key not in ctx.cache:
+        ctx.cache[key] = _rope_pair_norms(W)
+    return ctx.cache[key]
+
+
 def compute_rope_pair_var_Wq(ctx: "HeadContext") -> float:
     """
     Variance of RoPE-pair norms of W_q.
@@ -347,7 +352,7 @@ def compute_rope_pair_var_Wq(ctx: "HeadContext") -> float:
     rotational frequencies.
     """
     try:
-        pair_norms = _rope_pair_norms(ctx.W_q)
+        pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wq', ctx.W_q)
         return float(pair_norms.var().item())
     except Exception as e:
         print(f"Error in compute_rope_pair_var_Wq: {e}")
@@ -362,7 +367,7 @@ def compute_rope_pair_var_Wk(ctx: "HeadContext") -> float:
     projection matrix.
     """
     try:
-        pair_norms = _rope_pair_norms(ctx.W_k)
+        pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wk', ctx.W_k)
         return float(pair_norms.var().item())
     except Exception as e:
         print(f"Error in compute_rope_pair_var_Wk: {e}")
@@ -416,7 +421,7 @@ def compute_rope_pair_max_norm_Wq(ctx: "HeadContext") -> float:
     Measures dominance of a single channel after normalization.
     """
     try:
-        pair_norms = _rope_pair_norms(ctx.W_q)
+        pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wq', ctx.W_q)
         return _max_normalized_channel_share(pair_norms)
     except Exception as e:
         print(f"Error in compute_rope_pair_max_norm_Wq: {e}")
@@ -430,7 +435,7 @@ def compute_rope_pair_max_norm_Wk(ctx: "HeadContext") -> float:
     Measures dominance of a single channel after normalization.
     """
     try:
-        pair_norms = _rope_pair_norms(ctx.W_k)
+        pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wk', ctx.W_k)
         return _max_normalized_channel_share(pair_norms)
     except Exception as e:
         print(f"Error in compute_rope_pair_max_norm_Wk: {e}")
@@ -442,7 +447,7 @@ def compute_rope_pair_max_uniform_ratio_Wq(ctx: "HeadContext") -> float:
     Ratio of max normalized RoPE-pair share to uniform share for W_q.
     """
     try:
-        pair_norms = _rope_pair_norms(ctx.W_q)
+        pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wq', ctx.W_q)
         return _max_over_uniform_channel_share(pair_norms)
     except Exception as e:
         print(f"Error in compute_rope_pair_max_uniform_ratio_Wq: {e}")
@@ -454,7 +459,7 @@ def compute_rope_pair_max_uniform_ratio_Wk(ctx: "HeadContext") -> float:
     Ratio of max normalized RoPE-pair share to uniform share for W_k.
     """
     try:
-        pair_norms = _rope_pair_norms(ctx.W_k)
+        pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wk', ctx.W_k)
         return _max_over_uniform_channel_share(pair_norms)
     except Exception as e:
         print(f"Error in compute_rope_pair_max_uniform_ratio_Wk: {e}")
@@ -474,7 +479,7 @@ def compute_rope_freq_com_Wq(ctx: "HeadContext") -> float:
                 -> local patterns, near-diagonal/slash heads.
     """
     try:
-        pair_norms = _rope_pair_norms(ctx.W_q)
+        pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wq', ctx.W_q)
         K = pair_norms.shape[0]
         indices = torch.arange(K, dtype=torch.float32)
         com = float((indices * pair_norms).sum() / (pair_norms.sum() + 1e-12))
@@ -491,7 +496,7 @@ def compute_rope_freq_com_Wk(ctx: "HeadContext") -> float:
     Symmetric counterpart of compute_rope_freq_com_Wq applied to W_k.
     """
     try:
-        pair_norms = _rope_pair_norms(ctx.W_k)
+        pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wk', ctx.W_k)
         K = pair_norms.shape[0]
         indices = torch.arange(K, dtype=torch.float32)
         com = float((indices * pair_norms).sum() / (pair_norms.sum() + 1e-12))
@@ -522,12 +527,14 @@ def _compute_diagonal_mass(ctx: "HeadContext", band_width: int, shift: int = 0) 
     A = ctx.attention_map
     seq_len = A.shape[0]
     half = band_width // 2
-    
-    row = torch.arange(seq_len, device=A.device, dtype=torch.float32).unsqueeze(1)
-    col = torch.arange(seq_len, device=A.device, dtype=torch.float32).unsqueeze(0)
-    
-    # Distance is (row - col). We center the band around 'shift'
-    mask = (torch.abs((row - col) - shift) <= half).float()
+
+    if "diag_dist" not in ctx.cache:
+        row = torch.arange(seq_len, device=A.device, dtype=torch.float32).unsqueeze(1)
+        col = torch.arange(seq_len, device=A.device, dtype=torch.float32).unsqueeze(0)
+        ctx.cache["diag_dist"] = row - col
+
+    dist = ctx.cache["diag_dist"]
+    mask = (torch.abs(dist - shift) <= half).float()
     
     total = A.sum()
     if total <= 0:
@@ -609,16 +616,19 @@ def _compute_sink_mass(ctx: "HeadContext", token_pos: int = -1) -> float:
     if N < 2:
         return np.nan
 
-    row = torch.arange(N, device=A.device).unsqueeze(1)
-    col = torch.arange(N, device=A.device).unsqueeze(0)
-    mask = (row > col)
+    if "sink_per_col" not in ctx.cache:
+        row = torch.arange(N, device=A.device).unsqueeze(1)
+        col = torch.arange(N, device=A.device).unsqueeze(0)
+        mask = (row > col)
+        counts = mask.sum(dim=0).float()
+        ctx.cache["sink_valid_cols"] = counts > 0
+        ctx.cache["sink_per_col"] = (A * mask.float()).sum(dim=0) / counts.clamp(min=1.0)
 
-    counts = mask.sum(dim=0).float()
-    valid_cols = counts > 0
+    sink_per_col = ctx.cache["sink_per_col"]
+    valid_cols = ctx.cache["sink_valid_cols"]
+
     if not torch.any(valid_cols):
         return np.nan
-
-    sink_per_col = (A * mask.float()).sum(dim=0) / counts.clamp(min=1.0)
 
     if token_pos >= 0:
         if token_pos >= N or not bool(valid_cols[token_pos].item()):
@@ -694,6 +704,16 @@ def compute_sink_mass_max(ctx: "HeadContext") -> float:
 # Attention Map: Entropy and Sparsity
 # ==============================================================================
 
+
+def _get_causal_mask(ctx: "HeadContext") -> torch.Tensor:
+    """Causal lower-triangular boolean mask, cached per head."""
+    if "causal_mask" not in ctx.cache:
+        N = ctx.attention_map.shape[0]
+        ctx.cache["causal_mask"] = torch.tril(
+            torch.ones(N, N, dtype=torch.bool, device=ctx.attention_map.device)
+        )
+    return ctx.cache["causal_mask"]
+
 def compute_attention_entropy(ctx: "HeadContext") -> float:
     """
     Shannon entropy of causal attention rows — vectorized.
@@ -704,7 +724,7 @@ def compute_attention_entropy(ctx: "HeadContext") -> float:
         N = A.shape[0]
         if N < 2:
             return np.nan
-        mask = torch.tril(torch.ones(N, N, dtype=torch.bool, device=A.device))
+        mask = _get_causal_mask(ctx)
         A_masked = (A * mask).clamp(min=1e-12)
         # log(clamp) su celle fuori dalla maschera produce valori negativi
         # ma li azzeriamo moltiplicando di nuovo per mask
@@ -727,7 +747,7 @@ def compute_attention_gini(ctx: "HeadContext") -> float:
         where w_i are sorted in ascending order.
     """
     try:
-        mask = torch.tril(torch.ones_like(ctx.attention_map, dtype=torch.bool))
+        mask = _get_causal_mask(ctx)
         w, _ = torch.sort(ctx.attention_map[mask].flatten())
         n = w.shape[0]
         idx = torch.arange(1, n + 1, dtype=torch.float32)
@@ -752,7 +772,7 @@ def compute_attention_row_var_weighted(ctx: "HeadContext") -> float:
         if N < 2:
             return np.nan
         weights, variances = [], []
-        mask = torch.tril(torch.ones(N, N, dtype=torch.bool, device=A.device))
+        mask = _get_causal_mask(ctx).clone()
         mask[0] = False  # skip row 0
         counts = mask.sum(dim=1).float()  # (N,)
         means = (A * mask).sum(dim=1) / counts.clamp(min=1)
@@ -894,19 +914,12 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
 # ==============================================================================
 # Get All Features Function
 # ==============================================================================
-'''
+
 def get_all_features(ctx: "HeadContext") -> Dict[str, float]:
     """
     Compute all registered features for a given HeadContext.
-
-    Iterates through FEATURE_REGISTRY, runs each function with graceful
-    failure handling, and returns a flat dictionary of scalar floats.
-
-    Args:
-        ctx: HeadContext instance for a single (layer, head) pair.
-
-    Returns:
-        Dict[str, float]: Feature name to scalar value. np.nan on failure.
+    Iterates through FEATURE_REGISTRY with graceful failure handling.
+    Returns a flat dictionary of scalar floats (np.nan on failure).
     """
     results: Dict[str, float] = {}
     for name, func in FEATURE_REGISTRY.items():
@@ -916,39 +929,3 @@ def get_all_features(ctx: "HeadContext") -> Dict[str, float]:
             print(f"Warning: feature '{name}' failed with: {e}")
             results[name] = np.nan
     return results
-
-'''
-
-# core/features_library.py — modifica TEMPORANEA per profiling
-
-import time as _time
-
-_FEATURE_TIMES: dict = {}
-_FEATURE_CALLS: dict = {}
-
-def get_all_features(ctx):
-    results = {}
-    for name, fn in FEATURE_REGISTRY.items():
-        _t = _time.perf_counter()
-        try:
-            results[name] = fn(ctx)
-        except Exception as e:
-            results[name] = float("nan")
-        _dt = _time.perf_counter() - _t
-        _FEATURE_TIMES[name] = _FEATURE_TIMES.get(name, 0.0) + _dt
-        _FEATURE_CALLS[name] = _FEATURE_CALLS.get(name, 0)   + 1
-    return results
-
-
-def print_feature_profile(top_n: int = 20):
-    if not _FEATURE_TIMES:
-        print("Nessuna feature registrata — FEATURE_REGISTRY è vuoto o get_all_features non è stato chiamato.")
-        return
-    total = sum(_FEATURE_TIMES.values())
-    calls = next(iter(_FEATURE_CALLS.values()), 1)
-    print(f"\n{'Feature':<50} {'ms/call':>9}  {'total s':>9}  {'%':>6}")
-    print("-" * 78)
-    for name, t in sorted(_FEATURE_TIMES.items(), key=lambda x: -x[1])[:top_n]:
-        n = _FEATURE_CALLS.get(name, 1)
-        print(f"  {name:<48} {t/n*1000:>9.2f}  {t:>9.3f}  {100*t/total:>5.1f}%")
-    print(f"\n  TOTALE: {total:.3f}s  ({calls} head × {len(_FEATURE_TIMES)} feature)")
