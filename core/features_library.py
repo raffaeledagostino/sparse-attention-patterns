@@ -14,6 +14,7 @@ Key Design Principles:
   - FEATURE_REGISTRY is the single source of truth: add a function here only.
 """
 
+import math
 from typing import Callable, Dict, Tuple
 from flask import ctx
 import numpy as np
@@ -188,6 +189,26 @@ def compute_k_sim_consecutive(ctx: "HeadContext") -> float:
 # SVD Alignment (H vs W_q, H vs W_k)
 # ==============================================================================
 
+
+def build_rope_rotation(delta: int, d_head: int, theta_base: float = 10000.0) -> torch.Tensor:
+    """
+    Build the RoPE rotation matrix R_{Δθ} ∈ R^{d_head × d_head} for a relative
+    position delta.
+
+    The matrix acts on 2D subspaces (pairs of dimensions). delta=0 yields the
+    identity matrix.
+    """
+    R = torch.eye(d_head)
+    for k in range(d_head // 2):
+        theta_k = theta_base ** (-2 * k / d_head)
+        angle = theta_k * delta
+        c, s = math.cos(angle), math.sin(angle)
+        R[2 * k, 2 * k] = c
+        R[2 * k, 2 * k + 1] = -s
+        R[2 * k + 1, 2 * k] = s
+        R[2 * k + 1, 2 * k + 1] = c
+    return R
+
 def compute_svd_alignment_H_Wq(ctx: "HeadContext") -> float:
     """Riusa SVD già in cache — nessuna decomposizione aggiuntiva."""
     try:
@@ -207,40 +228,73 @@ def compute_svd_alignment_H_Wk(ctx: "HeadContext") -> float:
     except Exception as e:
         print(f"Error in compute_svd_alignment_H_Wk: {e}"); return np.nan
 
-def _get_cached_WqWk_svd(ctx: "HeadContext") -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _compute_WqRWk_alignment(ctx: "HeadContext", delta: int) -> float:
     """
-    SVD of M = W_q @ W_k^T in R^{d_h x d_h}.
-    """
-    if 'svd_WqWk' not in ctx.cache:
-        Wq = _to_svd_tensor(ctx.W_q)
-        Wk = _to_svd_tensor(ctx.W_k)
-        M  = Wq @ Wk.T                    
-        ctx.cache['svd_WqWk'] = _economy_svd(M)   
-    return ctx.cache['svd_WqWk']
+    Singular-value-weighted cosine similarity of M(Δ) = W_q R_{Δθ} W_k^T.
 
+    rho(Δ) = Σ_n (σ_n / Σ_m σ_m) * <u_n, v_n>
 
-def compute_WqWk_svd_alignment(ctx: "HeadContext") -> float:
-    """
-    Singular-value-weighted cosine similarity between left and right
-    singular vectors of the head interaction matrix M = W_q W_k^T.
-    A high weighted alignment means the head's query and key sides 'look 
-    for the same features' in the
-    leading singular modes.
-
-    rho = sum_n  (sigma_n / sum_m sigma_m) * <u_n, v_n>
-
-    Note: u_n and v_n are already unit-norm (columns of U and V from SVD),
-    so <u_n, v_n> is directly their cosine similarity.
-    Input-independent: computed once per head over the weight matrices.
+    delta=0 -> R=I -> equivalent to the old W_q/W_k alignment.
+    delta>0 measures intrinsic grouping tendency for tokens delta steps apart.
+    Input-independent: computed once per head from weight matrices only.
     """
     try:
-        U, S, Vh = _get_cached_WqWk_svd(ctx)
-        V = Vh.T  # [d_h, r]
-        cos_sim = (U * V).sum(dim=0)        # [r]
+        Wq, Wk = ctx.W_q, ctx.W_k
+        d_head = Wq.shape[0]
+        R = build_rope_rotation(delta, d_head, ctx.rope_theta).to(Wq.device, Wq.dtype)
+        M = Wq @ R @ Wk.T
+        U, S, Vh = _economy_svd(M)
+        V = Vh.T
+        cos_sim = (U * V).sum(dim=0)
         weights = S / (S.sum() + 1e-12)
         return float((weights * cos_sim).sum().item())
     except Exception as e:
-        print(f"Error in compute_WqWk_svd_alignment: {e}")
+        print(f"Error in _compute_WqRWk_alignment delta={delta}: {e}")
+        return np.nan
+
+
+def compute_WqRWk_alignment_delta_0(ctx: "HeadContext") -> float:
+    """QK alignment, Δ=0 (R=I). Equivalent to the old W_q/W_k alignment."""
+    try:
+        return _compute_WqRWk_alignment(ctx, delta=0)
+    except Exception as e:
+        print(f"Error in compute_WqRWk_alignment_delta_0: {e}")
+        return np.nan
+
+
+def compute_WqRWk_alignment_delta_1(ctx: "HeadContext") -> float:
+    """QK alignment for tokens 1 step apart (Δ=1)."""
+    try:
+        return _compute_WqRWk_alignment(ctx, delta=1)
+    except Exception as e:
+        print(f"Error in compute_WqRWk_alignment_delta_1: {e}")
+        return np.nan
+
+
+def compute_WqRWk_alignment_delta_2(ctx: "HeadContext") -> float:
+    """QK alignment for tokens 2 steps apart (Δ=2)."""
+    try:
+        return _compute_WqRWk_alignment(ctx, delta=2)
+    except Exception as e:
+        print(f"Error in compute_WqRWk_alignment_delta_2: {e}")
+        return np.nan
+
+
+def compute_WqRWk_alignment_delta_3(ctx: "HeadContext") -> float:
+    """QK alignment for tokens 3 steps apart (Δ=3)."""
+    try:
+        return _compute_WqRWk_alignment(ctx, delta=3)
+    except Exception as e:
+        print(f"Error in compute_WqRWk_alignment_delta_3: {e}")
+        return np.nan
+
+
+def compute_WqRWk_alignment_delta_4(ctx: "HeadContext") -> float:
+    """QK alignment for tokens 4 steps apart (Δ=4)."""
+    try:
+        return _compute_WqRWk_alignment(ctx, delta=4)
+    except Exception as e:
+        print(f"Error in compute_WqRWk_alignment_delta_4: {e}")
         return np.nan
     
 
@@ -787,7 +841,13 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
     # --- SVD Alignment (H vs projections) ---
     "svd_alignment_H_Wq":          compute_svd_alignment_H_Wq,
     "svd_alignment_H_Wk":          compute_svd_alignment_H_Wk,
-    "WqWk_svd_alignment":          compute_WqWk_svd_alignment,
+
+    # --- RoPE-aware QK alignment ---
+    "compute_WqRWk_alignment_delta_0": compute_WqRWk_alignment_delta_0,
+    "compute_WqRWk_alignment_delta_1": compute_WqRWk_alignment_delta_1,
+    "compute_WqRWk_alignment_delta_2": compute_WqRWk_alignment_delta_2,
+    "compute_WqRWk_alignment_delta_3": compute_WqRWk_alignment_delta_3,
+    "compute_WqRWk_alignment_delta_4": compute_WqRWk_alignment_delta_4,
 
     # --- RMSNorm and Channel Structure ---
     "rmsnorm_gamma_norm":           compute_rmsnorm_gamma_norm,
@@ -836,7 +896,7 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
 # ==============================================================================
 # Get All Features Function
 # ==============================================================================
-
+'''
 def get_all_features(ctx: "HeadContext") -> Dict[str, float]:
     """
     Compute all registered features for a given HeadContext.
@@ -858,3 +918,39 @@ def get_all_features(ctx: "HeadContext") -> Dict[str, float]:
             print(f"Warning: feature '{name}' failed with: {e}")
             results[name] = np.nan
     return results
+
+'''
+
+# core/features_library.py — modifica TEMPORANEA per profiling
+
+import time as _time
+
+_FEATURE_TIMES: dict = {}
+_FEATURE_CALLS: dict = {}
+
+def get_all_features(ctx):
+    results = {}
+    for name, fn in FEATURE_REGISTRY.items():
+        _t = _time.perf_counter()
+        try:
+            results[name] = fn(ctx)
+        except Exception as e:
+            results[name] = float("nan")
+        _dt = _time.perf_counter() - _t
+        _FEATURE_TIMES[name] = _FEATURE_TIMES.get(name, 0.0) + _dt
+        _FEATURE_CALLS[name] = _FEATURE_CALLS.get(name, 0)   + 1
+    return results
+
+
+def print_feature_profile(top_n: int = 20):
+    if not _FEATURE_TIMES:
+        print("Nessuna feature registrata — FEATURE_REGISTRY è vuoto o get_all_features non è stato chiamato.")
+        return
+    total = sum(_FEATURE_TIMES.values())
+    calls = next(iter(_FEATURE_CALLS.values()), 1)
+    print(f"\n{'Feature':<50} {'ms/call':>9}  {'total s':>9}  {'%':>6}")
+    print("-" * 78)
+    for name, t in sorted(_FEATURE_TIMES.items(), key=lambda x: -x[1])[:top_n]:
+        n = _FEATURE_CALLS.get(name, 1)
+        print(f"  {name:<48} {t/n*1000:>9.2f}  {t:>9.3f}  {100*t/total:>5.1f}%")
+    print(f"\n  TOTALE: {total:.3f}s  ({calls} head × {len(_FEATURE_TIMES)} feature)")
