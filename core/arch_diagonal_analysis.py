@@ -29,7 +29,7 @@ from config import (
 )
 from core.features_library import _economy_svd, _to_svd_tensor, build_rope_rotation
 from data.persistence import save_results
-from rope_builders import get_rope_builder_from_config
+from rope_builder import get_rope_builder_from_config
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
