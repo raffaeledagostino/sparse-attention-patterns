@@ -2,4 +2,5 @@ bozza.txt
 kaggle.json
 kaggle_dataset/
 kaggle.json
-.parquet
+*.parquet
+*.png

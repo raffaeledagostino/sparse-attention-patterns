@@ -24,7 +24,7 @@ class HeadContext:
     Q:              torch.Tensor
     K:              torch.Tensor
     attention_map:  torch.Tensor
-    rope_theta:     float = 100000.0
+    rope_theta:     float = 100_000.0
     rmsnorm_gamma:  Optional[torch.Tensor] = None
     cache:          Dict[str, Any] = field(default_factory=dict)
 
