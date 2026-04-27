@@ -278,7 +278,7 @@ class LightweightAttentionAnalyzer:
                 rope_theta = getattr(
                     getattr(attention_module, "rotary_emb", None),
                     "base",
-                    getattr(self.model.config, "rope_theta", 100000.0),
+                    getattr(self.model.config, "rope_theta", 1_000_000.0),
                 )
 
                 layer_attentions = attentions[layer_idx].squeeze(0)

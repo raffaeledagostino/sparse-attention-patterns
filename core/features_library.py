@@ -188,25 +188,18 @@ def compute_k_sim_consecutive(ctx: "HeadContext") -> float:
 # ==============================================================================
 
 
-def build_rope_rotation(delta: int, d_head: int, theta_base: float = 10000.0) -> torch.Tensor:
-    """
-    Build the RoPE rotation matrix R_{Δθ} ∈ R^{d_head × d_head} for a relative
-    position delta.
-
-    The matrix acts on 2D subspaces (pairs of dimensions). delta=0 yields the
-    identity matrix.
-    """
+def build_rope_rotation(delta: int, d_head: int, theta_base: float = 1_000_000.0) -> torch.Tensor:
     half = d_head // 2
-    k = torch.arange(half, dtype=torch.float32)
+    k    = torch.arange(half, dtype=torch.float32)
     angles = (theta_base ** (-2.0 * k / d_head)) * delta
     cos_a, sin_a = angles.cos(), angles.sin()
 
-    idx = k.long() * 2
-    R = torch.zeros(d_head, d_head)
-    R[idx, idx] = cos_a
-    R[idx, idx + 1] = -sin_a
-    R[idx + 1, idx] = sin_a
-    R[idx + 1, idx + 1] = cos_a
+    idx = torch.arange(half, dtype=torch.long)
+    R   = torch.zeros(d_head, d_head)
+    R[idx,        idx       ] =  cos_a   # (m,      m)
+    R[idx,        idx + half] = -sin_a   # (m,      m+half)
+    R[idx + half, idx       ] =  sin_a   # (m+half, m)
+    R[idx + half, idx + half] =  cos_a   # (m+half, m+half)
     return R
 
 def compute_svd_alignment_H_Wq(ctx: "HeadContext") -> float:
