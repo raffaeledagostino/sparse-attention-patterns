@@ -187,13 +187,13 @@ def build_rope_rotation_qwen3(
 def build_rope_rotation_mistral(
     delta: int,
     d_head: int = 128,
-    rope_theta: float = 10_000.0,
+    rope_theta: float = 1_000_000.0,
 ) -> torch.Tensor:
     """
     RoPE rotation matrix for mistralai/Mistral-7B-Instruct-v0.3.
 
     Spec:
-      rope_theta = 1e4  (standard RoPE, no scaling)
+      rope_theta = 1e6  (standard RoPE, no scaling)
       QK-norm    = NO
       GQA        = 32Q : 8KV  (kv_idx = q_idx // 4)
       Sliding window = 4096 (inactive for seq_len <= 64)
