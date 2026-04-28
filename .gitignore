@@ -4,3 +4,4 @@ kaggle_dataset/
 kaggle.json
 *.parquet
 *.png
+*.csv

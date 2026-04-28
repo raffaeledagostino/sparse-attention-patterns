@@ -155,8 +155,8 @@ class LightweightAttentionAnalyzer:
             return "cpu"
     
     def analyze_prompt(self, prompt, max_length=128, layer_indices=None,
-                    head_indices=None, prompt_source="unknown"):
-        
+                   head_indices=None, prompt_source="unknown"):
+
         tokens = self.tokenizer(prompt, return_tensors="pt", padding=True,
                                 truncation=True, max_length=max_length)
         input_ids = tokens["input_ids"]
@@ -184,7 +184,7 @@ class LightweightAttentionAnalyzer:
             raise RuntimeError(f"Forward pass failed: {e}")
 
         hidden_states = outputs.hidden_states
-        attentions = outputs.attentions
+        attentions    = outputs.attentions
         if not attentions:
             raise RuntimeError(
                 "Forward pass did not return attention tensors. "
@@ -219,37 +219,38 @@ class LightweightAttentionAnalyzer:
                     print(f"[Analyzer]   Skipping layer {layer_idx}: projections not found.")
                     continue
 
-                # Ensure projections are on the same device as hidden states.
                 W_q = W_q.to(H_input.device)
                 W_k = W_k.to(H_input.device)
                 W_v = W_v.to(H_input.device)
 
-                num_q_heads = getattr(attention_module, "num_heads",
+                num_q_heads  = getattr(attention_module, "num_heads",
                             getattr(attention_module, "num_attention_heads",
                                     self.model.config.num_attention_heads))
                 num_kv_heads = getattr(attention_module, "num_key_value_heads",
                             getattr(self.model.config, "num_key_value_heads", num_q_heads))
-                head_dim = getattr(attention_module, "head_dim",
-                        getattr(self.model.config, "head_dim",
-                                W_q.shape[0] // num_q_heads))
+                head_dim     = getattr(attention_module, "head_dim",
+                            getattr(self.model.config, "head_dim",
+                                    W_q.shape[0] // num_q_heads))
                 kv_group_size = max(1, num_q_heads // max(1, num_kv_heads))
 
-                W_q_heads = W_q.reshape(num_q_heads, head_dim, -1)
-                W_k_heads = W_k.reshape(num_kv_heads, head_dim, -1)
-                W_v_heads = W_v.reshape(num_kv_heads, head_dim, -1)
-
                 # ------------------------------------------------------------------
-                # Q/K source: manual projection + QK-Norm (post-normalization,
-                # pre-RoPE) for every model.
+                # Move everything to CPU float32 once per layer
                 # ------------------------------------------------------------------
                 _f32 = lambda t: t.detach().cpu().float() if t is not None else None
 
-                H_cpu   = _f32(H_input)                        # (512, 896) — condiviso
-                W_q_cpu = _f32(W_q)                            # (896, 896)
-                W_k_cpu = _f32(W_k)                            # (128, 896) GQA
+                H_cpu   = _f32(H_input)
+                W_q_cpu = _f32(W_q)
+                W_k_cpu = _f32(W_k)
                 W_v_cpu = _f32(W_v)
 
-                # Q/K projection + QK-Norm (invariato, ma su device del modello)
+                # Per-head weight slices: (n_heads, head_dim, d_model)
+                W_q_heads_cpu = W_q_cpu.reshape(num_q_heads,  head_dim, -1)
+                W_k_heads_cpu = W_k_cpu.reshape(num_kv_heads, head_dim, -1)
+                W_v_heads_cpu = W_v_cpu.reshape(num_kv_heads, head_dim, -1)
+
+                # ------------------------------------------------------------------
+                # Q/K projection + optional QK-Norm (on model device, then to CPU)
+                # ------------------------------------------------------------------
                 Q_raw = H_input @ W_q.T
                 if hasattr(attention_module, "q_proj") and attention_module.q_proj.bias is not None:
                     Q_raw = Q_raw + attention_module.q_proj.bias.to(H_input.device)
@@ -259,6 +260,7 @@ class LightweightAttentionAnalyzer:
                 if hasattr(attention_module, "k_proj") and attention_module.k_proj.bias is not None:
                     K_raw = K_raw + attention_module.k_proj.bias.to(H_input.device)
                 K_all = K_raw.reshape(seq_len, num_kv_heads, head_dim)
+                del Q_raw, K_raw
 
                 if hasattr(attention_module, "q_norm") and attention_module.q_norm is not None:
                     with torch.no_grad():
@@ -267,9 +269,9 @@ class LightweightAttentionAnalyzer:
                     with torch.no_grad():
                         K_all = attention_module.k_norm(K_all)
 
-                del Q_raw, K_raw
+                Q_all_cpu = Q_all.detach().cpu().float()
+                K_all_cpu = K_all.detach().cpu().float()
 
-                # QK-norm gamma
                 qk_norm_gamma = None
                 if hasattr(attention_module, "q_norm") and \
                         hasattr(attention_module.q_norm, "weight"):
@@ -281,22 +283,12 @@ class LightweightAttentionAnalyzer:
                     getattr(self.model.config, "rope_theta", 1_000_000.0),
                 )
 
-                layer_attentions = attentions[layer_idx].squeeze(0)
+                layer_attentions     = attentions[layer_idx].squeeze(0)
                 layer_attentions_cpu = layer_attentions.detach().cpu().float()
 
-                # Reshape weight heads già su CPU float32
-                W_q_heads_cpu = W_q_cpu.reshape(num_q_heads,  head_dim, -1)
-                W_k_heads_cpu = W_k_cpu.reshape(num_kv_heads, head_dim, -1)
-                W_v_heads_cpu = W_v_cpu.reshape(num_kv_heads, head_dim, -1)
-
-                # Normalize Q_all and K_all to CPU float32 ONCE per layer
-                Q_all_cpu = Q_all.detach().cpu().float()
-                K_all_cpu = K_all.detach().cpu().float()
-
                 # ------------------------------------------------------------------
-                # PRE-COMPUTE ALL SVDs — once per layer, inject into each head's cache
+                # Local SVD helpers (defined once per layer for readability)
                 # ------------------------------------------------------------------
-                
                 def _layer_economy_svd(m: torch.Tensor):
                     try:
                         return torch.linalg.svd(m, full_matrices=False)
@@ -314,44 +306,27 @@ class LightweightAttentionAnalyzer:
                         "r95": int((torch.cumsum(probs, 0) < 0.95).sum().item()) + 1,
                     }
 
-                # Pre-compute SVDs once for the entire layer
-                # These will be injected into ctx.cache for each head
+                # ------------------------------------------------------------------
+                # Pre-compute layer-level SVDs (shared across all heads)
+                # ------------------------------------------------------------------
                 _svd_H = _layer_economy_svd(H_cpu)
-                _svd_Wq = _layer_economy_svd(W_q_cpu)
-                _svd_Wk = _layer_economy_svd(W_k_cpu)
-                _svd_Wv = _layer_economy_svd(W_v_cpu)
-                
-                # Pre-compute attention map SVDs per head
-                _svd_attn_per_head = {}
-                for _hi in head_indices:
-                    _A = layer_attentions_cpu[_hi]
-                    _svd_attn_per_head[_hi] = _layer_economy_svd(_A)
-                
-                # Pre-inject static layer-level SVDs into a template cache
-                _layer_cache_template = {
-                    "svd_H":    _svd_H,
-                    "rank_svd_H": _rank_metrics(_svd_H[1]),
-                    "svd_Wq":   _svd_Wq,
-                    "rank_svd_Wq": _rank_metrics(_svd_Wq[1]),
-                    "svd_Wk":   _svd_Wk,
-                    "rank_svd_Wk": _rank_metrics(_svd_Wk[1]),
-                    "svd_Wv":   _svd_Wv,
-                    "rank_svd_Wv": _rank_metrics(_svd_Wv[1]),
+
+                # Pre-compute per-head attention map SVDs
+                _svd_attn_per_head = {
+                    _hi: _layer_economy_svd(layer_attentions_cpu[_hi])
+                    for _hi in head_indices
                 }
 
                 # ------------------------------------------------------------------
-                # Loop head
+                # Head loop
                 # ------------------------------------------------------------------
                 for head_idx in head_indices:
                     kv_head_idx = head_idx // kv_group_size if num_kv_heads < num_q_heads \
-                                  else head_idx
+                                else head_idx
                     kv_head_idx = min(kv_head_idx, num_kv_heads - 1)
-                    
-                    # Pre-compute per-head Q and K SVDs
-                    _Q_head = Q_all_cpu[:, head_idx, :]
-                    _K_head = K_all_cpu[:, kv_head_idx, :]
-                    _svd_Q_head = _layer_economy_svd(_Q_head)
-                    _svd_K_head = _layer_economy_svd(_K_head)
+
+                    _Q_head = Q_all_cpu[:, head_idx,    :]   # (seq_len, head_dim)
+                    _K_head = K_all_cpu[:, kv_head_idx, :]   # (seq_len, head_dim)
 
                     ctx = HeadContext(
                         model_name=self.model_name,
@@ -369,52 +344,66 @@ class LightweightAttentionAnalyzer:
                         rmsnorm_gamma=qk_norm_gamma,
                     )
 
-                    # Inject pre-computed layer-level SVDs (shared across all heads)
-                    ctx.cache.update(_layer_cache_template)
-                    
-                    # Inject per-head SVDs
-                    ctx.cache['svd_Q'] = _svd_Q_head
-                    ctx.cache['rank_svd_Q'] = _rank_metrics(_svd_Q_head[1])
-                    ctx.cache['svd_K'] = _svd_K_head
-                    ctx.cache['rank_svd_K'] = _rank_metrics(_svd_K_head[1])
-                    
-                    # Inject attention map SVD (pre-computed per head)
-                    _svd_A_head = _svd_attn_per_head[head_idx]
-                    ctx.cache['svd_A'] = _svd_A_head
-                    ctx.cache['rank_svd_A'] = _rank_metrics(_svd_A_head[1])
+                    # H — shared across all heads in the layer
+                    ctx.cache['svd_H']      = _svd_H
+                    ctx.cache['rank_svd_H'] = _rank_metrics(_svd_H[1])
+
+                    # W_q / W_k / W_v — per-head slices (128 × 4096 each)
+                    for _key, _mat in [
+                        ('svd_Wq', W_q_heads_cpu[head_idx]),
+                        ('svd_Wk', W_k_heads_cpu[kv_head_idx]),
+                        ('svd_Wv', W_v_heads_cpu[kv_head_idx]),
+                    ]:
+                        _s = _layer_economy_svd(_mat)
+                        ctx.cache[_key]           = _s
+                        ctx.cache['rank_' + _key] = _rank_metrics(_s[1])
+
+                    # Projected Q / K — per-head (seq_len × head_dim each)
+                    for _key, _mat in [
+                        ('svd_Q', _Q_head),
+                        ('svd_K', _K_head),
+                    ]:
+                        _s = _layer_economy_svd(_mat)
+                        ctx.cache[_key]           = _s
+                        ctx.cache['rank_' + _key] = _rank_metrics(_s[1])
+
+                    # Attention map — per-head, pre-computed above
+                    _svd_A = _svd_attn_per_head[head_idx]
+                    ctx.cache['svd_A']      = _svd_A
+                    ctx.cache['rank_svd_A'] = _rank_metrics(_svd_A[1])
 
                     features = get_all_features(ctx)
-                    result = {
+                    results.append({
                         "model_name":    self.model_name,
                         "layer_idx":     layer_idx,
                         "head_idx":      head_idx,
                         "prompt_len":    seq_len,
                         "prompt_source": prompt_source,
-                    }
-                    result.update(features)
-                    results.append(result)
-
+                        **features,
+                    })
                     del ctx
 
-                del H_input, W_q, W_k, W_v, W_q_heads, W_k_heads, W_v_heads, \
-                    Q_all, K_all, layer_attentions, attention_module, \
-                    H_cpu, W_q_cpu, W_k_cpu, W_v_cpu, Q_all_cpu, K_all_cpu, layer_attentions_cpu, \
-                    W_q_heads_cpu, W_k_heads_cpu, W_v_heads_cpu, \
-                    _layer_cache_template, _svd_attn_per_head
+                # ------------------------------------------------------------------
+                # Eager eviction — free all layer tensors before next layer
+                # ------------------------------------------------------------------
+                del H_input, W_q, W_k, W_v, W_q_heads_cpu, W_k_heads_cpu, W_v_heads_cpu, \
+                    Q_all, K_all, Q_all_cpu, K_all_cpu, layer_attentions, layer_attentions_cpu, \
+                    H_cpu, W_q_cpu, W_k_cpu, W_v_cpu, \
+                    attention_module, _svd_H, _svd_attn_per_head
                 gc.collect()
-                if self.device == "mps":   torch.mps.empty_cache()
+                if self.device == "mps":    torch.mps.empty_cache()
                 elif self.device == "cuda": torch.cuda.empty_cache()
 
         finally:
             del hidden_states, attentions, outputs, input_ids, tokens
             gc.collect()
-            if self.device == "mps":   torch.mps.empty_cache()
+            if self.device == "mps":    torch.mps.empty_cache()
             elif self.device == "cuda": torch.cuda.empty_cache()
 
         print(f"[Analyzer] Completed. Extracted {len(results)} head-level feature sets.")
         assert len(results) == len(layer_indices) * len(head_indices), \
             f"Expected {len(layer_indices)*len(head_indices)} rows, got {len(results)}"
-        return results
+        return results    
     
     def _get_attention_module(self, layer_idx: int) -> Optional[Any]:
         """
