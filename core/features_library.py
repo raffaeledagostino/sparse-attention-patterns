@@ -77,6 +77,38 @@ def _get_cached_rank(ctx: "HeadContext", svd_key: str, matrix: torch.Tensor) -> 
     return ctx.cache[rank_key]
 
 
+def _gini_coefficient(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """
+    Vectorized Gini coefficient along `dim` for non-negative distributions.
+
+    G = (2 * sum_i i * x_(i)) / (n * sum_i x_(i)) - (n + 1) / n
+    where x_(i) are sorted in ascending order.
+    """
+    x = x.float()
+    x_sorted, _ = torch.sort(x, dim=dim)
+    n = x_sorted.shape[dim]
+    if n == 0:
+        return torch.full_like(x_sorted.sum(dim=dim), float('nan'))
+    idx = torch.arange(1, n + 1, device=x_sorted.device, dtype=x_sorted.dtype)
+    shape = [1] * x_sorted.dim()
+    shape[dim] = n
+    idx = idx.view(*shape)
+    total = x_sorted.sum(dim=dim)
+    total = total.clamp(min=1e-12)
+    gini = (2.0 * (idx * x_sorted).sum(dim=dim)) / (n * total) - (n + 1.0) / n
+    return gini
+
+
+def _mean_gini_topk_vectors(vectors: torch.Tensor, top_k: int) -> float:
+    """Mean Gini over top_k vectors in a tensor shaped (k, d)."""
+    if vectors.numel() == 0:
+        return np.nan
+    k = min(top_k, vectors.shape[0])
+    q = vectors[:k].pow(2.0)
+    gini_vals = _gini_coefficient(q, dim=-1)
+    return float(gini_vals.mean().item())
+
+
 # ==============================================================================
 # Rank of Weight Matrices (W_q, W_k, W_v)
 # ==============================================================================
@@ -251,41 +283,46 @@ def compute_WqRWk_alignment_delta_0(ctx: "HeadContext") -> float:
         return np.nan
 
 
-def compute_WqRWk_alignment_delta_1(ctx: "HeadContext") -> float:
-    """QK alignment for tokens 1 step apart (Δ=1)."""
+def compute_gini_left_Wq(ctx: "HeadContext", top_k: int = 4) -> float:
+    """Mean Gini of top-K left singular vectors of W_q (output space)."""
     try:
-        return _compute_WqRWk_alignment(ctx, delta=1)
+        U, _, _ = _get_cached_svd(ctx, 'svd_Wq', ctx.W_q)
+        vectors = U.T  # (d_h, d_h) -> rows are left singular vectors
+        return _mean_gini_topk_vectors(vectors, top_k=top_k)
     except Exception as e:
-        print(f"Error in compute_WqRWk_alignment_delta_1: {e}")
-        return np.nan
+        print(f"Error in compute_gini_left_Wq: {e}"); return np.nan
 
 
-def compute_WqRWk_alignment_delta_2(ctx: "HeadContext") -> float:
-    """QK alignment for tokens 2 steps apart (Δ=2)."""
+def compute_gini_right_Wq(ctx: "HeadContext", top_k: int = 4) -> float:
+    """Mean Gini of top-K right singular vectors of W_q (input space)."""
     try:
-        return _compute_WqRWk_alignment(ctx, delta=2)
+        _, _, Vh = _get_cached_svd(ctx, 'svd_Wq', ctx.W_q)
+        vectors = Vh  # (d_h, d_model) rows are right singular vectors
+        return _mean_gini_topk_vectors(vectors, top_k=top_k)
     except Exception as e:
-        print(f"Error in compute_WqRWk_alignment_delta_2: {e}")
-        return np.nan
+        print(f"Error in compute_gini_right_Wq: {e}"); return np.nan
 
 
-def compute_WqRWk_alignment_delta_3(ctx: "HeadContext") -> float:
-    """QK alignment for tokens 3 steps apart (Δ=3)."""
+def compute_gini_left_Wk(ctx: "HeadContext", top_k: int = 4) -> float:
+    """Mean Gini of top-K left singular vectors of W_k (output space)."""
     try:
-        return _compute_WqRWk_alignment(ctx, delta=3)
+        U, _, _ = _get_cached_svd(ctx, 'svd_Wk', ctx.W_k)
+        vectors = U.T  # (d_h, d_h)
+        return _mean_gini_topk_vectors(vectors, top_k=top_k)
     except Exception as e:
-        print(f"Error in compute_WqRWk_alignment_delta_3: {e}")
-        return np.nan
+        print(f"Error in compute_gini_left_Wk: {e}"); return np.nan
 
 
-def compute_WqRWk_alignment_delta_4(ctx: "HeadContext") -> float:
-    """QK alignment for tokens 4 steps apart (Δ=4)."""
+def compute_gini_right_Wk(ctx: "HeadContext", top_k: int = 4) -> float:
+    """Mean Gini of top-K right singular vectors of W_k (input space)."""
     try:
-        return _compute_WqRWk_alignment(ctx, delta=4)
+        _, _, Vh = _get_cached_svd(ctx, 'svd_Wk', ctx.W_k)
+        vectors = Vh
+        return _mean_gini_topk_vectors(vectors, top_k=top_k)
     except Exception as e:
-        print(f"Error in compute_WqRWk_alignment_delta_4: {e}")
-        return np.nan
-    
+        print(f"Error in compute_gini_right_Wk: {e}"); return np.nan
+
+
 
 # ==============================================================================
 # RMSNorm Gamma and Channel-Wise Variance and Center of Mass of RoPE Frequencies
@@ -406,33 +443,6 @@ def _max_over_uniform_channel_share(channel_magnitudes: torch.Tensor) -> float:
         return np.nan
     return float((normalized.max() * K).item())
 
-
-def compute_rope_pair_max_norm_Wq(ctx: "HeadContext") -> float:
-    """
-    Maximum normalized RoPE-pair channel share of W_q.
-
-    Measures dominance of a single channel after normalization.
-    """
-    try:
-        pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wq', ctx.W_q)
-        return _max_normalized_channel_share(pair_norms)
-    except Exception as e:
-        print(f"Error in compute_rope_pair_max_norm_Wq: {e}")
-        return np.nan
-
-
-def compute_rope_pair_max_norm_Wk(ctx: "HeadContext") -> float:
-    """
-    Maximum normalized RoPE-pair channel share of W_k.
-
-    Measures dominance of a single channel after normalization.
-    """
-    try:
-        pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wk', ctx.W_k)
-        return _max_normalized_channel_share(pair_norms)
-    except Exception as e:
-        print(f"Error in compute_rope_pair_max_norm_Wk: {e}")
-        return np.nan
 
 
 def compute_rope_pair_max_uniform_ratio_Wq(ctx: "HeadContext") -> float:
@@ -707,26 +717,6 @@ def _get_causal_mask(ctx: "HeadContext") -> torch.Tensor:
         )
     return ctx.cache["causal_mask"]
 
-def compute_attention_entropy(ctx: "HeadContext") -> float:
-    """
-    Shannon entropy of causal attention rows — vectorized.
-    H = mean_i( -sum_j A[i,j] * log(A[i,j]) )  for j <= i only.
-    """
-    try:
-        A = ctx.attention_map.float()
-        N = A.shape[0]
-        if N < 2:
-            return np.nan
-        mask = _get_causal_mask(ctx)
-        A_masked = (A * mask).clamp(min=1e-12)
-        # log(clamp) su celle fuori dalla maschera produce valori negativi
-        # ma li azzeriamo moltiplicando di nuovo per mask
-        row_entropies = -(A * torch.log(A_masked) * mask).sum(dim=1)  # [N]
-        return float(row_entropies.mean().item())
-    except Exception as e:
-        print(f"Error in compute_attention_entropy: {e}")
-        return np.nan
-
 
 def compute_attention_gini(ctx: "HeadContext") -> float:
     """
@@ -752,31 +742,6 @@ def compute_attention_gini(ctx: "HeadContext") -> float:
 
 
 
-
-def compute_attention_row_var_weighted(ctx: "HeadContext") -> float:
-    """
-    Degrees-of-freedom weighted mean of per-row variances of A.
-    Rows are weighted by their number of valid causal elements (i+1),
-    correcting for instability of variance estimates in early rows.
-    """
-    try:
-        A = ctx.attention_map.float()  # [N, N]
-        N = A.shape[0]
-        if N < 2:
-            return np.nan
-        weights, variances = [], []
-        mask = _get_causal_mask(ctx).clone()
-        mask[0] = False  # skip row 0
-        counts = mask.sum(dim=1).float()  # (N,)
-        means = (A * mask).sum(dim=1) / counts.clamp(min=1)
-        sq_diff = ((A - means.unsqueeze(1)) ** 2) * mask
-        variances = sq_diff.sum(dim=1) / counts.clamp(min=1)
-        weights = counts
-        return float((weights[1:] * variances[1:]).sum() / weights[1:].sum())
-
-    except Exception as e:
-        print(f"Error in compute_attention_row_var_weighted: {e}")
-        return np.nan
 
 
 
@@ -855,10 +820,12 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
 
     # --- RoPE-aware QK alignment ---
     "compute_WqRWk_alignment_delta_0": compute_WqRWk_alignment_delta_0,
-    "compute_WqRWk_alignment_delta_1": compute_WqRWk_alignment_delta_1,
-    "compute_WqRWk_alignment_delta_2": compute_WqRWk_alignment_delta_2,
-    "compute_WqRWk_alignment_delta_3": compute_WqRWk_alignment_delta_3,
-    "compute_WqRWk_alignment_delta_4": compute_WqRWk_alignment_delta_4,
+
+    # --- Gini over top-K singular vectors ---
+    "gini_left_Wq":                compute_gini_left_Wq,
+    "gini_right_Wq":               compute_gini_right_Wq,
+    "gini_left_Wk":                compute_gini_left_Wk,
+    "gini_right_Wk":               compute_gini_right_Wk,
 
     # --- RMSNorm and Channel Structure ---
     "rmsnorm_gamma_norm":           compute_rmsnorm_gamma_norm,
@@ -866,8 +833,6 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
     # Channel spread and dominance over RoPE pairs
     "rope_pair_var_Wq":             compute_rope_pair_var_Wq,
     "rope_pair_var_Wk":             compute_rope_pair_var_Wk,
-    "rope_pair_max_norm_Wq":        compute_rope_pair_max_norm_Wq,
-    "rope_pair_max_norm_Wk":        compute_rope_pair_max_norm_Wk,
     "rope_pair_max_ratio_Wq":       compute_rope_pair_max_uniform_ratio_Wq,
     "rope_pair_max_ratio_Wk":       compute_rope_pair_max_uniform_ratio_Wk,
     
@@ -891,9 +856,7 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
     "sink_mass_max":                compute_sink_mass_max,
 
     # --- Attention Map: Entropy and Variance ---
-    "attention_entropy":            compute_attention_entropy,
     "attention_gini":               compute_attention_gini,
-    "attention_row_var_weighted":   compute_attention_row_var_weighted,
 
     # --- Attention Map: Structural ---
     "look_back":                    compute_look_back,
