@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 
 from config import OUTPUT_PATH, PRIMARY_KEY
 from data.persistence import save_results
@@ -114,16 +115,14 @@ def run_analysis_batch(
     latest_df = pd.DataFrame()
     existing_prompt_ids = _load_existing_prompt_ids(output_path)
 
-    for index, prompt_idx in enumerate(prompt_indices):
+    progress = tqdm(enumerate(prompt_indices), total=total, desc="Processing prompts")
+    for index, prompt_idx in progress:
         prompt, prompt_id = source.get_prompt(prompt_idx)
 
         # Skip prompts that have already been analyzed
         if prompt_id in existing_prompt_ids:
             elapsed = _format_elapsed(time.perf_counter() - loop_start)
-            print(f"[Skip] {prompt_id} already done")
-            print(
-                f"[Progress] {index + 1}/{total} | elapsed: {elapsed} | last: {prompt_id}"
-            )
+            progress.set_postfix_str(f"skip {prompt_id} | elapsed {elapsed}")
             continue
 
         # Analyze the prompt
@@ -145,10 +144,7 @@ def run_analysis_batch(
 
         # Progress reporting
         elapsed = _format_elapsed(time.perf_counter() - loop_start)
-        print(f"[Done] {prompt_id} saved ({index + 1}/{total})")
-        print(
-            f"[Progress] {index + 1}/{total} | elapsed: {elapsed} | last: {prompt_id}"
-        )
+        progress.set_postfix_str(f"saved {prompt_id} | elapsed {elapsed}")
 
         # Cleanup device memory before next prompt
         _cleanup_device(device)

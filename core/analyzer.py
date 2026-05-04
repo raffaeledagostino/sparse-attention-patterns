@@ -17,6 +17,7 @@ import warnings
 from contextlib import nullcontext
 import torch
 import numpy as np
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
@@ -205,8 +206,7 @@ class LightweightAttentionAnalyzer:
         results = []
 
         try:
-            for layer_idx in layer_indices:
-                print(f"[Analyzer]   Layer {layer_idx}/{num_layers - 1}...")
+            for layer_idx in tqdm(layer_indices, desc="Processing layers"):
 
                 H_input = hidden_states[layer_idx].squeeze(0)
                 attention_module = self._get_attention_module(layer_idx)
