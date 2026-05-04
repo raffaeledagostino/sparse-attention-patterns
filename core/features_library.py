@@ -54,15 +54,17 @@ def _get_cached_svd(ctx: "HeadContext", key: str, matrix: torch.Tensor):
     return ctx.cache[key]
 
 def _rank_metrics_from_S(S: torch.Tensor) -> Dict[str, float]:
-    """Compute effective_rank and r95 from precomputed singular values."""
     total = S.sum() + 1e-12
     probs = S / total
     p_nz = probs[probs > 1e-12]
     entropy = -torch.sum(p_nz * torch.log(p_nz))
-    cumsum = torch.cumsum(probs, dim=0)
+    S_sq   = S ** 2
+    cumvar = torch.cumsum(S_sq, dim=0) / (S_sq.sum() + 1e-12)
+    r95    = int((cumvar < 0.95).sum().item()) + 1
+
     return {
         "effective_rank": float(torch.exp(entropy).item()),
-        "r95": int((cumsum < 0.95).sum().item()) + 1,
+        "r95": r95,
     }
 
 def _get_cached_rank(ctx: "HeadContext", svd_key: str, matrix: torch.Tensor) -> Dict[str, float]:
@@ -283,7 +285,7 @@ def compute_WqRWk_alignment_delta_0(ctx: "HeadContext") -> float:
         return np.nan
 
 
-def compute_gini_left_Wq(ctx: "HeadContext", top_k: int = 4) -> float:
+def compute_gini_left_Wq(ctx: "HeadContext", top_k: int = 128) -> float:
     """Mean Gini of top-K left singular vectors of W_q (output space)."""
     try:
         U, _, _ = _get_cached_svd(ctx, 'svd_Wq', ctx.W_q)
@@ -293,7 +295,7 @@ def compute_gini_left_Wq(ctx: "HeadContext", top_k: int = 4) -> float:
         print(f"Error in compute_gini_left_Wq: {e}"); return np.nan
 
 
-def compute_gini_right_Wq(ctx: "HeadContext", top_k: int = 4) -> float:
+def compute_gini_right_Wq(ctx: "HeadContext", top_k: int = 128) -> float:
     """Mean Gini of top-K right singular vectors of W_q (input space)."""
     try:
         _, _, Vh = _get_cached_svd(ctx, 'svd_Wq', ctx.W_q)
@@ -303,7 +305,7 @@ def compute_gini_right_Wq(ctx: "HeadContext", top_k: int = 4) -> float:
         print(f"Error in compute_gini_right_Wq: {e}"); return np.nan
 
 
-def compute_gini_left_Wk(ctx: "HeadContext", top_k: int = 4) -> float:
+def compute_gini_left_Wk(ctx: "HeadContext", top_k: int = 128) -> float:
     """Mean Gini of top-K left singular vectors of W_k (output space)."""
     try:
         U, _, _ = _get_cached_svd(ctx, 'svd_Wk', ctx.W_k)
@@ -313,7 +315,7 @@ def compute_gini_left_Wk(ctx: "HeadContext", top_k: int = 4) -> float:
         print(f"Error in compute_gini_left_Wk: {e}"); return np.nan
 
 
-def compute_gini_right_Wk(ctx: "HeadContext", top_k: int = 4) -> float:
+def compute_gini_right_Wk(ctx: "HeadContext", top_k: int = 128) -> float:
     """Mean Gini of top-K right singular vectors of W_k (input space)."""
     try:
         _, _, Vh = _get_cached_svd(ctx, 'svd_Wk', ctx.W_k)
@@ -476,10 +478,6 @@ def compute_rope_freq_com_Wq(ctx: "HeadContext") -> float:
     Computes the attention-weighted mean frequency index:
         FreqCoM = sum_k(k * c_k) / sum_k(c_k)
 
-    Low values: projection energy concentrated in low-frequency pairs
-                -> long-range dependencies, global/sink-like heads.
-    High values: energy concentrated in high-frequency pairs
-                -> local patterns, near-diagonal/slash heads.
     """
     try:
         pair_norms = _get_cached_rope_pair_norms(ctx, 'rope_pair_norms_Wq', ctx.W_q)
