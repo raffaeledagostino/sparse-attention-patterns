@@ -837,6 +837,8 @@ FEATURE_REGISTRY: Dict[str, Callable] = {
     "rope_freq_com_Wq":             compute_rope_freq_com_Wq,
     "rope_freq_com_Wk":             compute_rope_freq_com_Wk,
 
+    # targets
+
     # --- Attention Map: Diagonal ---
     "diagonal_mass_1":              compute_diagonal_mass_1,
     "diagonal_mass_5":              compute_diagonal_mass_5,
