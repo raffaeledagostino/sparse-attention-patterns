@@ -123,7 +123,6 @@ class RandomTokenPromptSource(PromptSource):
 
 
 
-
 import abc
 from typing import Optional
 import numpy as np
@@ -145,16 +144,16 @@ class PromptSource(abc.ABC):
 class StreamingDatasetPromptSource(PromptSource):
     """
     Prompt source backed by a Hugging Face dataset in streaming mode.
-    Ideal for massive datasets like C4 or OpenWebText where downloading
+    Ideal for massive datasets like FineWeb-Edu where downloading
     the full dataset is not feasible.
     """
 
     def __init__(
         self,
         tokenizer,
-        dataset_name: str,
-        target_tokens: int,
-        dataset_config: Optional[str] = None,
+        dataset_name: str = "HuggingFaceFW/fineweb-edu",
+        target_tokens: int = 512,
+        dataset_config: Optional[str] = "sample-10BT", # Configurazione raccomandata per test
         split: str = "train",
         text_column: str = "text",
         min_chars: int = 100,
@@ -173,16 +172,17 @@ class StreamingDatasetPromptSource(PromptSource):
 
     @property
     def source_tag(self) -> str:
+        tag_name = self.dataset_name.split("/")[-1]
         if self.dataset_config is None:
-            return f"{self.dataset_name}_{self.split}_stream"
-        return f"{self.dataset_name}_{self.dataset_config}_{self.split}_stream"
+            return f"{tag_name}_{self.split}_stream"
+        return f"{tag_name}_{self.dataset_config}_{self.split}_stream"
 
     def _initialize_stream(self) -> None:
         """Initialize the Hugging Face streaming dataset iterator."""
         if self._iterator is None:
             ds = load_dataset(
                 self.dataset_name, 
-                self.dataset_config, 
+                name=self.dataset_config, # FineWeb usa l'argomento 'name' per i dump
                 split=self.split, 
                 streaming=True
             )
@@ -193,6 +193,7 @@ class StreamingDatasetPromptSource(PromptSource):
         self._initialize_stream()
         
         # Un'euristica rapida per evitare di tokenizzare stringhe palesemente troppo corte
+        # In media 1 token = ~4 caratteri. Buffer di 3x per sicurezza
         min_chars_threshold = max(self.min_chars, self.target_tokens * 3)
 
         while len(self._cached_prompts) <= target_idx:
