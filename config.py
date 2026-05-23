@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 # ── Model ────────────────────────────────────────────────────────────────
-MODEL_NAME = "Qwen/Qwen3-4B"
+MODEL_NAME = "mistralai/Mistral-7B-Instruct-v0.3"
 MODEL_NAME_SMALL = "Qwen/Qwen2.5-0.5B-Instruct"
 MODEL_NAME_SMALL_2 = "Qwen/Qwen3-0.6B"
 
@@ -36,6 +36,6 @@ PROMPT_PREVIEW_CHARS = 100
 
 
 # ── Persistence ──────────────────────────────────────────────────────────
-OUTPUT_PATH = Path("data/Qwen3_4B_512tok.parquet")
+OUTPUT_PATH = Path("data/Mistral_512tok.parquet")
 PRIMARY_KEY = ["model_name", "prompt_id", "layer_idx", "head_idx"]
 # trigger test

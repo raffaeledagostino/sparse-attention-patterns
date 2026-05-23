@@ -18,11 +18,16 @@ MODEL_DEP_FEATURES = [
     "rope_pair_var_Wq", "rope_pair_var_Wk",
     "rope_pair_max_ratio_Wq", "rope_pair_max_ratio_Wk",
     "rope_freq_com_Wq", "rope_freq_com_Wk",
+    "rmsnorm_gamma_norm",
     "compute_WqRWk_alignment_delta_0",
 ]
 
 INPUT_DEP_FEATURES = [
+    #"effective_rank_H", "r95_H",
+    #"effective_rank_Q", "r95_Q",
+    #"effective_rank_K", "r95_K",
     "q_sim_consecutive", "k_sim_consecutive",
+    #"svd_alignment_H_Wq", "svd_alignment_H_Wk",
 ]
 
 TARGET = "sink_mass_token_0"

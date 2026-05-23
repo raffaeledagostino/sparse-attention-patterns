@@ -348,7 +348,7 @@ class LightweightAttentionAnalyzer:
                     ctx.cache['svd_H']      = _svd_H
                     ctx.cache['rank_svd_H'] = _rank_metrics(_svd_H[1])
 
-                    # W_q / W_k / W_v — per-head slices (128 × 4096 each)
+                    # W_q / W_k / W_v — per-head slices 
                     for _key, _mat in [
                         ('svd_Wq', W_q_heads_cpu[head_idx]),
                         ('svd_Wk', W_k_heads_cpu[kv_head_idx]),
