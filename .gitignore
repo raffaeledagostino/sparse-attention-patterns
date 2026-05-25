@@ -5,3 +5,4 @@ kaggle.json
 *.parquet
 *.png
 *.csv
+*.html
