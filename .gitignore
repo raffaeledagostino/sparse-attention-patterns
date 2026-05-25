@@ -6,3 +6,8 @@ kaggle.json
 *.png
 *.csv
 *.html
+attention plot mistral
+attention plot qwen
+__pycache__/
+.github/workflows/
+thesis images
