@@ -5,10 +5,12 @@ kaggle_dataset/
 *.parquet
 *.csv
 *.html
+*.ipynb
 
 *.png
 thesis_images/
 attention plot mistral/
 attention plot qwen/
+dtasets_produced/
 
 __pycache__/
