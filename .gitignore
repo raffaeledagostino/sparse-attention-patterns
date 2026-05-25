@@ -1,13 +1,14 @@
+kaggle.json
 bozza.txt
-kaggle.json
+
 kaggle_dataset/
-kaggle.json
 *.parquet
-*.png
 *.csv
 *.html
-attention plot mistral
-attention plot qwen
+
+*.png
+thesis_images/
+attention plot mistral/
+attention plot qwen/
+
 __pycache__/
-.github/workflows/
-thesis images
