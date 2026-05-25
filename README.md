@@ -25,7 +25,7 @@ No training or pipeline changes are required — new features compute on the fly
 
 Models and device support
 - The code was developed with models similar in structure to Qwen3 and Mistral v0.7 (both tested here). It will work for other HuggingFace models that expose per-layer attention modules (common pattern: `model.model.layers[i].self_attn`).
-- Device selection is automatic (MPS > CUDA > CPU) but you can force `--device` on the CLI.
+- Device selection is automatic (MPS > CUDA > CPU) but you can force `--device` on the CLI. Right now it is built to be used on CUDA, specifically in Kaggle.
 
 EDA and target prediction
 - The `eda.py` script and notebooks show feature distributions, correlations, and basic visualizations.

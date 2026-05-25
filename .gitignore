@@ -9,8 +9,10 @@ kaggle_dataset/
 
 *.png
 thesis_images/
-attention plot mistral/
-attention plot qwen/
+attention plots mistral/
+attention plots qwen/
 dtasets_produced/
+modeling_start.py
+results/
 
 __pycache__/
