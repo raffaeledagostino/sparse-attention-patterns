@@ -226,7 +226,7 @@ def split_by_length_stratified(
     seed:           int   = 42,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Split dataset by prompt length.
+    Split by prompt length.
     Train/val: prompt_len in train_lengths.
     Test: prompt_len in test_lengths (unseen distribution).
     Validation is sampled stratified by (prompt_len, prompt_source).
@@ -252,7 +252,7 @@ def head_mean_baseline(
 ) -> np.ndarray:
     """
     Exp. 1 — Cross-Prompt baseline.
-    For each test head: use the mean target for that head across other
+    For each test head: mean target for that head across other
     prompts in the training set. Fallback: global train mean.
     """
     head_means = (
@@ -276,7 +276,7 @@ def nearest_neighbor_baseline(
     """
     Exp. 2 — Cross-Head baseline.
     Exact value from the nearest head in the train set (L2 distance on
-    MODEL_DEP_FEATURES normalized by std). No averaging — single nearest neighbor.
+    MODEL_DEP_FEATURES normalised by std). No averaging — single nearest neighbour.
     """
     md_cols = [c for c in feat_cols if c in MODEL_DEP_FEATURES and c in df_train.columns]
     if not md_cols:
@@ -302,14 +302,14 @@ def length_corrected_head_mean_baseline(
 ) -> np.ndarray:
     """
     Exp. 3 — Length Generalisation baseline.
-    Adjusts the head mean from the train set with an additive correction
-    for prompt length:
+    Corrects the per-head train mean with an additive length correction:
 
         pred(h, L_test) = mu_h_train
                         + beta_h * (log(L_test) - mean(log(L_train)))
 
-    where beta_h is estimated by OLS on (log(prompt_len), target) per
-    head. Captures systematic target trends with length without observing L_test.
+    beta_h is estimated by OLS on (log(prompt_len), target) per head
+    in the train set. Captures systematic target trends with length
+    without requiring any observation at L_test.
     """
     log_len_col = "__log_len__"
     df_train = df_train.copy()
@@ -352,25 +352,25 @@ def length_corrected_head_mean_baseline(
 
 # ── Hyperparameter tuning (Optuna) ────────────────────────────────────────────
 #
-# Calibrated ranges aim to reach at least the ~40% lift observed with fixed
-# parameters on diagonal_mass_* targets. Optuna's objective is MAE on validation.
+# Range calibrati per raggiungere almeno il lift del 40% osservato con
+# parametri fissi su diagonal_mass_*. L'obiettivo Optuna è MAE su val.
 #
 # Rationale for ranges:
 #   learning_rate  [0.01, 0.15]: avoids too-low lr (slow, no early-stopping gain)
 #                                or too-high lr (underfitting).
-#   num_leaves     [15, 255]:    15 is sufficient for small datasets; 255
-#                                allows complexity for harder targets.
+#   num_leaves     [15, 255]:    15 is sufficient for small datasets; 255 allows
+#                                complexity for harder targets.
 #   feature_fraction [0.5, 1.0]: with ~18-20 features, 0.5 gives diversity;
 #                                1.0 uses all features.
-#   bagging_fraction [0.5, 1.0]: similar rationale for rows subsampling.
-#   min_child_samples [5, 50]:   lower bound for cross-head (n~256), upper
+#   bagging_fraction [0.5, 1.0]: same rationale for row subsampling.
+#   min_child_samples [5, 50]:   low bound for cross-head (n~256), upper
 #                                bound 50 for cross-prompt (n>>1000).
-#   lambda_l1      [1e-4, 10]:   L1 regularization; log range covers near-zero
+#   lambda_l1      [1e-4, 10]:   L1 regularisation; log range covers near-zero
 #                                to strong penalties.
 #   lambda_l2      [1e-4, 10]:   same rationale for L2.
 #
-# num_boost_round=2000 + early_stopping(60) ensures convergence without fixing
-# a suboptimal num_rounds value.
+# num_boost_round=2000 + early_stopping(60) ensures convergence without
+# fixing a suboptimal num_rounds value.
 
 def _lgbm_objective(
     trial:    optuna.Trial,
@@ -529,10 +529,10 @@ def evaluate(
     baseline_fn: str = "head_mean",        # "head_mean" | "length_corrected"
 ) -> Tuple[dict, pd.DataFrame]:
     """
-    Evaluate model on the test set.
-    baseline_fn selects which baseline to use for computing lift:
-        - "head_mean"        → head_mean_baseline        (Exp 1, cross-prompt)
-        - "length_corrected" → length_corrected_head_mean_baseline (Exp 3)
+    Evaluate the model on the test set.
+    baseline_fn selects which baseline to use for lift computation:
+      - "head_mean"        → head_mean_baseline          (Exp 1, cross-prompt)
+      - "length_corrected" → length_corrected_head_mean_baseline (Exp 3)
     """
     X_te = df_test[features].values
     y_te = df_test[target].values
@@ -576,7 +576,7 @@ def evaluate_head(
     label:      str = "",
 ) -> Tuple[dict, pd.DataFrame]:
     """
-    Evaluate model in the cross-head setting.
+    Evaluate the model in the cross-head setting.
     Baseline: nearest_neighbor_baseline (exact L2 nearest head value).
     """
     X_te = df_test[feats].fillna(0).values
@@ -612,8 +612,8 @@ def aggregate_per_head(
     """
     Aggregate the dataset per (layer_idx, head_idx).
     MODEL_DEP: .first() — model-level constants by definition.
-    INPUT_DEP: mean and std across prompts (summarizes input-conditional distribution).
-    Target: median, mean, std for robust description.
+    INPUT_DEP: mean and std across prompts (summarises input-conditional distribution).
+    Target: median, mean, std for a robust description.
     """
     model_dep = [f for f in features if f in MODEL_DEP_FEATURES and f in df.columns]
     input_dep = [f for f in features if f in INPUT_DEP_FEATURES and f in df.columns]
@@ -701,7 +701,7 @@ def _run_one(
 
     return row, model, features, df_pred
 
-# ── Internal loop over all targets ──────────────────────────────────────────
+# ── Internal loop su tutti i target ──────────────────────────────────────────
 
 def _run_all_targets(
     df_train:    pd.DataFrame,
@@ -715,6 +715,7 @@ def _run_all_targets(
     seed:        int,
     exp_tag:     str,
     baseline_fn: str = "head_mean",
+    out_dir:     Optional[Path] = None,
 ) -> pd.DataFrame:
     rows: list = []
     valid_targets = [t for t in targets if t in df.columns]
@@ -722,7 +723,7 @@ def _run_all_targets(
     done  = 0
 
     for target in valid_targets:
-        # Separate tuning for each variant
+        # Separate tuning per variant
         best_params_per_variant: Dict[str, Optional[dict]] = {v: None for v in FEATURE_SETS}
         if tune:
             for var_name, features in FEATURE_SETS.items():
@@ -736,6 +737,14 @@ def _run_all_targets(
                 best_params_per_variant[var_name] = tune_lgbm(
                     df_tr_clean, df_va_clean, feats_avail, target, n_trials, seed)
                 print("done.")
+
+            # Save best_params to disk after tuning all variants for this target
+            if out_dir is not None:
+                import json
+                params_path = out_dir / f"best_params_{_safe_name(target)}.json"
+                params_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(params_path, "w") as fp:
+                    json.dump(best_params_per_variant, fp, indent=2)
 
         for var_name, features in FEATURE_SETS.items():
             done += 1
@@ -754,10 +763,11 @@ def _run_all_targets(
             row, model, feats, df_pred = result
             rows.append(row)
             _RUN_CACHE[(exp_tag, cfg.key, target, var_name)] = {
-                "model":    model,
-                "feats":    feats,
-                "df_pred":  df_pred,
-                "df_train": df_train,
+                "model":      model,
+                "feats":      feats,
+                "df_pred":    df_pred,
+                "df_train":   df_train,
+                "best_params": best_params_per_variant.get(var_name),
             }
             print(f"R²={row['R2']:.4f}  MAE={row['MAE']:.5f}  lift={row['lift']:+.1%}")
 
@@ -922,7 +932,7 @@ def plot_r2_vs_lift_panels(
     cfg:          ModelConfig,
     out_dir:      Optional[Path] = None,
     title_suffix: str = "Cross-Prompt",
-    lift_col:     str = "lift",         # "lift" | "lift_nn" depending on experiment
+    lift_col:     str = "lift",         # "lift" | "lift_nn" a seconda dell'exp
 ) -> plt.Figure:
     GROUPS = {
         "Diagonal targets": {
@@ -1018,7 +1028,7 @@ def plot_r2_vs_lift_panels(
     plt.show()
     return fig
 
-# ── Helper: build pivot for r2_vs_lift ───────────────────────────────────
+# ── Helper: costruisce pivot per r2_vs_lift ───────────────────────────────────
 
 def _build_pivot(df_results: pd.DataFrame, lift_col: str = "lift") -> Optional[pd.DataFrame]:
     pivot_rows: dict = {}
@@ -1040,7 +1050,7 @@ def run_cross_prompt_experiment(
     target:         Optional[str] = None,
     prompt_sources: Optional[List[str]] = None,
     tune:           bool = True,
-    n_trials:       int  = 20,
+    n_trials:       int  = 40,
     seed:           int  = 42,
     out_dir:        Optional[Path] = None,
 ) -> dict:
@@ -1202,6 +1212,7 @@ def run_cross_prompt_all_targets(
         df_train, df_val, df_test, df,
         cfg, targets, tune, n_trials, seed,
         exp_tag=exp_tag, baseline_fn="head_mean",
+        out_dir=out_dir,
     )
 
     if out_dir is not None and len(df_results):
@@ -1228,9 +1239,9 @@ def run_length_generalization(
     out_dir:        Optional[Path] = None,
 ) -> pd.DataFrame:
     """
-    Generalization to unseen prompt lengths.
+    Generalisation to unseen prompt lengths.
     Baseline: length_corrected_head_mean (mean + OLS correction for log(prompt_len)).
-    Lift = improvement of the model over this length-corrected baseline.
+    Lift = model improvement relative to this corrected baseline.
     """
     exp_tag = "length_gen"
     out_dir = Path(out_dir) / cfg.key / "length_generalization" if out_dir else None
@@ -1252,6 +1263,7 @@ def run_length_generalization(
         df_train, df_val, df_test, df,
         cfg, targets, tune, n_trials, seed,
         exp_tag=exp_tag, baseline_fn="length_corrected",
+        out_dir=out_dir,
     )
 
     if out_dir is not None and len(df_results):
@@ -1276,13 +1288,13 @@ def run_all_models(
     out_dir:     Path  = Path("results"),
 ) -> Dict[str, dict]:
     """
-    Run all experiments for each model in model_cfgs.
+    Run all experiments for every model in model_cfgs.
 
     Parameters
     ----------
     datasets     : {model_key: dataframe}
-                   For length_generalization must contain prompts of
-                   different lengths (column prompt_len).
+                   For length_generalization must contain prompts at
+                   multiple lengths (column prompt_len).
     model_cfgs   : list of ModelConfig
     experiments  : subset of
                    ["cross_prompt", "cross_head", "all_targets",
@@ -1290,7 +1302,7 @@ def run_all_models(
                    Default: all four.
     tune         : enable Optuna (True recommended)
     n_trials     : Optuna trials per variant × target
-    out_dir      : root folder for results
+    out_dir      : root results directory
 
     Returns
     -------
