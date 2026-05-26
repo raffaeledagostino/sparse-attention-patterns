@@ -412,7 +412,7 @@ def tune_lgbm(
     df_val:   pd.DataFrame,
     features: List[str],
     target:   str,
-    n_trials: int = 40,
+    n_trials: int = 20,
     seed:     int = 42,
 ) -> dict:
     """Return best hyperparameters found by Optuna TPE."""
@@ -1050,7 +1050,7 @@ def run_cross_prompt_experiment(
     target:         Optional[str] = None,
     prompt_sources: Optional[List[str]] = None,
     tune:           bool = True,
-    n_trials:       int  = 40,
+    n_trials:       int = 20,
     seed:           int  = 42,
     out_dir:        Optional[Path] = None,
 ) -> dict:
@@ -1124,7 +1124,7 @@ def run_cross_head_experiment(
     target:        Optional[str] = None,
     prompt_source: Optional[str] = None,
     tune:          bool = True,
-    n_trials:      int  = 40,
+    n_trials:      int = 20,
     seed:          int  = 42,
     out_dir:       Optional[Path] = None,
 ) -> dict:
@@ -1192,7 +1192,7 @@ def run_cross_prompt_all_targets(
     targets:        List[str] = ALL_TARGETS,
     prompt_sources: Optional[List[str]] = None,
     tune:           bool = True,
-    n_trials:       int  = 40,
+    n_trials:       int = 20,
     seed:           int  = 42,
     out_dir:        Optional[Path] = None,
 ) -> pd.DataFrame:
@@ -1234,7 +1234,7 @@ def run_length_generalization(
     test_lengths:   Tuple[int, ...] = (512,),
     val_frac:       float = 0.15,
     tune:           bool  = True,
-    n_trials:       int   = 40,
+    n_trials:       int   = 20,
     seed:           int   = 42,
     out_dir:        Optional[Path] = None,
 ) -> pd.DataFrame:
@@ -1283,7 +1283,7 @@ def run_all_models(
     experiments: List[str] = ["cross_prompt", "cross_head", "all_targets",
                                "length_generalization"],
     tune:        bool  = True,
-    n_trials:    int   = 40,
+    n_trials:    int   = 20,
     seed:        int   = 42,
     out_dir:     Path  = Path("results"),
 ) -> Dict[str, dict]:
