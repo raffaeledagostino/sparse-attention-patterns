@@ -12,7 +12,7 @@ thesis_images/
 attention plots mistral/
 attention plots qwen/
 dtasets_produced/
-modeling_start.py
+#modeling_start.py
 results/
 
 __pycache__/
