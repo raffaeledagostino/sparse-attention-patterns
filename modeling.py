@@ -412,7 +412,7 @@ def tune_lgbm(
     df_val:   pd.DataFrame,
     features: List[str],
     target:   str,
-    n_trials: int = 20,
+    n_trials: int = 10,
     seed:     int = 42,
 ) -> dict:
     """Return best hyperparameters found by Optuna TPE."""
@@ -771,6 +771,10 @@ def _run_all_targets(
             }
             print(f"R²={row['R2']:.4f}  MAE={row['MAE']:.5f}  lift={row['lift']:+.1%}")
 
+    if not rows:
+        return pd.DataFrame(
+            columns=["target", "variant"]
+        ).set_index(["target", "variant"])
     return (
         pd.DataFrame(rows)
         .set_index(["target", "variant"])
@@ -1050,7 +1054,7 @@ def run_cross_prompt_experiment(
     target:         Optional[str] = None,
     prompt_sources: Optional[List[str]] = None,
     tune:           bool = True,
-    n_trials:       int = 20,
+    n_trials:       int  = 10,
     seed:           int  = 42,
     out_dir:        Optional[Path] = None,
 ) -> dict:
@@ -1124,7 +1128,7 @@ def run_cross_head_experiment(
     target:        Optional[str] = None,
     prompt_source: Optional[str] = None,
     tune:          bool = True,
-    n_trials:      int = 20,
+    n_trials:      int  = 10,
     seed:          int  = 42,
     out_dir:       Optional[Path] = None,
 ) -> dict:
@@ -1192,7 +1196,7 @@ def run_cross_prompt_all_targets(
     targets:        List[str] = ALL_TARGETS,
     prompt_sources: Optional[List[str]] = None,
     tune:           bool = True,
-    n_trials:       int = 20,
+    n_trials:       int  = 10,
     seed:           int  = 42,
     out_dir:        Optional[Path] = None,
 ) -> pd.DataFrame:
@@ -1234,7 +1238,7 @@ def run_length_generalization(
     test_lengths:   Tuple[int, ...] = (512,),
     val_frac:       float = 0.15,
     tune:           bool  = True,
-    n_trials:       int   = 20,
+    n_trials:       int   = 10,
     seed:           int   = 42,
     out_dir:        Optional[Path] = None,
 ) -> pd.DataFrame:
@@ -1245,6 +1249,20 @@ def run_length_generalization(
     """
     exp_tag = "length_gen"
     out_dir = Path(out_dir) / cfg.key / "length_generalization" if out_dir else None
+
+    # Guard: dataset must contain prompt_len and the required lengths
+    if "prompt_len" not in df.columns:
+        print(f"  [SKIP] {cfg.label} — length_generalization: "
+              f"column 'prompt_len' not found.")
+        return pd.DataFrame()
+    available = set(df["prompt_len"].unique())
+    if not any(l in available for l in train_lengths) or \
+       not any(l in available for l in test_lengths):
+        print(f"  [SKIP] {cfg.label} — length_generalization: "
+              f"required lengths not present. "
+              f"Available: {sorted(available)}, "
+              f"need train={train_lengths}, test={test_lengths}.")
+        return pd.DataFrame()
 
     df_train, df_val, df_test = split_by_length_stratified(
         df,
@@ -1275,6 +1293,110 @@ def run_length_generalization(
                                    title_suffix="Length Generalisation", lift_col="lift")
     return df_results
 
+
+# ── Experiment 2b: cross-head, all targets ────────────────────────────────────
+
+def run_cross_head_all_targets(
+    df:       pd.DataFrame,
+    cfg:      ModelConfig,
+    targets:  List[str] = ALL_TARGETS,
+    tune:     bool = True,
+    n_trials: int  = 10,
+    seed:     int  = 42,
+    out_dir:  Optional[Path] = None,
+) -> pd.DataFrame:
+    """
+    Run cross-head experiment on every target in `targets`.
+    For each target: aggregate per head, split by head, train LightGBM,
+    evaluate with nearest-neighbour baseline.
+    Saves metrics CSV and r2_vs_lift plot under <out_dir>/<model_key>/cross_head/.
+    Use run_cross_head_experiment() for interactive single-target exploration.
+    """
+    out_dir_exp = Path(out_dir) / cfg.key / "cross_head" if out_dir else None
+
+    print(f"\n{'═'*62}")
+    print(f"  {cfg.label} — Cross-Head (all targets)")
+    print(f"{'═'*62}\n")
+
+    rows: list = []
+    valid_targets = [t for t in targets if t in df.columns]
+    total = len(valid_targets) * len(FEATURE_SETS)
+    done  = 0
+
+    for target in valid_targets:
+        best_params_per_variant: Dict[str, Optional[dict]] = {v: None for v in FEATURE_SETS}
+
+        # Tuning: done once per (target, variant) on the aggregated dataset
+        if tune:
+            for var_name, feats in FEATURE_SETS.items():
+                feats_avail = [f for f in feats if f in df.columns]
+                df_agg, feat_cols = aggregate_per_head(df, feats_avail, target, cfg)
+                df_tr, df_va, _   = split_by_head(df_agg, seed=seed)
+                if len(df_tr) < 5:
+                    continue
+                print(f"     Optuna [CH/{var_name}] {target} ({n_trials} trials)...",
+                      end=" ", flush=True)
+                best_params_per_variant[var_name] = tune_lgbm(
+                    df_tr, df_va, feat_cols, "target_median", n_trials, seed)
+                print("done.")
+
+            if out_dir_exp is not None:
+                import json
+                params_path = out_dir_exp / f"best_params_{_safe_name(target)}.json"
+                params_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(params_path, "w") as fp:
+                    json.dump(best_params_per_variant, fp, indent=2)
+
+        for var_name, feats in FEATURE_SETS.items():
+            done += 1
+            feats_avail = [f for f in feats if f in df.columns]
+            print(f"[{done:>3}/{total}] {target:<38} {var_name}", end="  ")
+
+            df_agg, feat_cols = aggregate_per_head(df, feats_avail, target, cfg)
+            df_tr, df_va, df_te = split_by_head(df_agg, seed=seed)
+
+            if len(df_tr) < 5 or len(df_te) < 2:
+                print("SKIP"); continue
+
+            model, feats_used = train_lgbm_head(
+                df_tr, df_va, feat_cols,
+                params_override=best_params_per_variant.get(var_name),
+                seed=seed,
+            )
+            metrics, df_pred = evaluate_head(
+                model, feats_used, df_tr, df_te,
+                label=f"CH/{var_name}/{target}",
+            )
+            row = {
+                "target":  target,
+                "variant": var_name,
+                **{k: round(v, 5) if isinstance(v, float) else v
+                   for k, v in metrics.items()
+                   if k not in ("label",)},
+            }
+            rows.append(row)
+            print(f"R²={metrics['R2']:.4f}  MAE={metrics['MAE']:.5f}  "
+                  f"lift_nn={metrics['lift_nn']:+.1%}")
+
+    if not rows:
+        return pd.DataFrame(columns=["target", "variant"]).set_index(["target", "variant"])
+
+    df_results = (
+        pd.DataFrame(rows)
+        .set_index(["target", "variant"])
+        .sort_index()
+    )
+
+    if out_dir_exp is not None and len(df_results):
+        out_dir_exp.mkdir(parents=True, exist_ok=True)
+        _save_csv(df_results, out_dir_exp / "all_targets_results.csv")
+        pivot = _build_pivot(df_results, lift_col="lift_nn")
+        if pivot is not None:
+            plot_r2_vs_lift_panels(pivot, cfg, out_dir=out_dir_exp,
+                                   title_suffix="Cross-Head", lift_col="lift_nn")
+
+    return df_results
+
 # ── Top-level multi-model runner ──────────────────────────────────────────────
 
 def run_all_models(
@@ -1283,7 +1405,7 @@ def run_all_models(
     experiments: List[str] = ["cross_prompt", "cross_head", "all_targets",
                                "length_generalization"],
     tune:        bool  = True,
-    n_trials:    int   = 20,
+    n_trials:    int   = 10,
     seed:        int   = 42,
     out_dir:     Path  = Path("results"),
 ) -> Dict[str, dict]:
@@ -1319,12 +1441,18 @@ def run_all_models(
         model_results: dict = {}
 
         if "cross_prompt" in experiments:
-            model_results["cross_prompt"] = run_cross_prompt_experiment(
-                df, cfg, tune=tune, n_trials=n_trials, seed=seed, out_dir=out_dir,
+            # Iterates over ALL_TARGETS with cross-prompt split.
+            # Saves under <out_dir>/<model>/cross_prompt/.
+            # Use run_cross_prompt_experiment() for interactive single-target.
+            model_results["cross_prompt"] = run_cross_prompt_all_targets(
+                df, cfg, tune=tune, n_trials=n_trials, seed=seed,
+                out_dir=out_dir,
             )
 
         if "cross_head" in experiments:
-            model_results["cross_head"] = run_cross_head_experiment(
+            # Iterates over ALL_TARGETS with cross-head split.
+            # Use run_cross_head_experiment() for interactive single-target.
+            model_results["cross_head"] = run_cross_head_all_targets(
                 df, cfg, tune=tune, n_trials=n_trials, seed=seed, out_dir=out_dir,
             )
 
