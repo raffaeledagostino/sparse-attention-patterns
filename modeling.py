@@ -1040,7 +1040,7 @@ def run_cross_prompt_experiment(
     target:         Optional[str] = None,
     prompt_sources: Optional[List[str]] = None,
     tune:           bool = True,
-    n_trials:       int  = 40,
+    n_trials:       int  = 20,
     seed:           int  = 42,
     out_dir:        Optional[Path] = None,
 ) -> dict:
