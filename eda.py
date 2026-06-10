@@ -67,7 +67,7 @@ plt.rcParams.update({
 N_COLS          = 2
 STRIP_THRESHOLD = 80    # kept for _choose_plot_type logic, strip path removed
 RANK_PADDING    = 5
-SAVE_PLOTS      = False
+SAVE_PLOTS      = True
 out_dir         = Path("thesis_images"); out_dir.mkdir(exist_ok=True)
 
 QUARTILE_COLORS = ["#3B4CC0", "#6EC6C6", "#F4A44A", "#D65F5F"]
@@ -1502,40 +1502,248 @@ def _make_plotly_heatmap(corr: pd.DataFrame,
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
+import plotly.graph_objects as go
+
+
+def _make_plotly_heatmap_rect(
+    corr:        pd.DataFrame,
+    title:       str,
+    feat_to_cat: dict,
+    cell_h:      int = 38,    # altezza pixel per cella (asse Y)
+    cell_w:      int = 52,    # larghezza pixel per cella (asse X)
+    font_size:   int = 10,    # font dentro le celle
+    show_text:   bool = True, # mostra i valori numerici nelle celle
+) -> "go.Figure":
+    """
+    Heatmap rettangolare (predictors × targets) con layout ottimizzato
+    per leggibilità e salvataggio PNG per tesi.
+    """
+    row_feats = list(corr.index)
+    col_feats = list(corr.columns)
+    n_r = len(row_feats)
+    n_c = len(col_feats)
+
+    z    = corr.values
+    text = [
+        [f"{v:+.2f}" if not np.isnan(v) else "—" for v in row]
+        for row in z
+    ]
+
+    # Colore testo adattivo: bianco su celle scure, nero su celle chiare
+    textcolor = [
+        ["white" if abs(v) > 0.5 else "black" for v in row]
+        for row in z
+    ]
+
+    # ── Dimensioni dinamiche ───────────────────────────────────────────────────
+    margin_l = 220   # spazio per label Y (nomi feature predictor, spesso lunghi)
+    margin_b = 200   # spazio per label X ruotate (-45°)
+    margin_t = 100   # titolo
+    margin_r = 120   # colorbar
+
+    plot_w = n_c * cell_w + margin_l + margin_r
+    plot_h = n_r * cell_h + margin_t + margin_b
+
+    # ── Heatmap trace ──────────────────────────────────────────────────────────
+    heatmap = go.Heatmap(
+        z=z,
+        x=col_feats,
+        y=row_feats,
+        text=text if show_text else None,
+        texttemplate="%{text}" if show_text else None,
+        textfont=dict(size=font_size, color="black"),  # override sotto
+        colorscale="RdBu_r",
+        zmid=0,
+        zmin=-1,
+        zmax=1,
+        colorbar=dict(
+            title=dict(text="ρ", font=dict(size=13)),
+            thickness=18,
+            len=0.85,
+            tickfont=dict(size=11),
+        ),
+        hoverongaps=False,
+        hovertemplate="<b>%{y}</b> × <b>%{x}</b><br>ρ = %{z:.3f}<extra></extra>",
+        xgap=1,  # piccolo gap tra le celle per separazione visiva
+        ygap=1,
+    )
+
+    fig = go.Figure(heatmap)
+
+    # ── Testo adattivo (bianco/nero) via annotations ───────────────────────────
+    # Plotly non supporta textcolor per cella nel Heatmap → usiamo annotations
+    if show_text:
+        annotations = []
+        for i, row_f in enumerate(row_feats):
+            for j, col_f in enumerate(col_feats):
+                val = z[i, j]
+                if np.isnan(val):
+                    continue
+                color = "white" if abs(val) > 0.50 else "#111111"
+                annotations.append(dict(
+                    x=col_f,
+                    y=row_f,
+                    text=f"{val:+.2f}",
+                    showarrow=False,
+                    font=dict(size=font_size, color=color),
+                    xref="x",
+                    yref="y",
+                ))
+        fig.update_layout(annotations=annotations)
+
+    # ── Layout ─────────────────────────────────────────────────────────────────
+    fig.update_layout(
+        title=dict(
+            text=title,
+            font=dict(size=13, family="Arial"),
+            x=0.0,
+            xanchor="left",
+            pad=dict(l=margin_l),
+        ),
+        width=plot_w,
+        height=plot_h,
+        margin=dict(l=margin_l, r=margin_r, t=margin_t, b=margin_b),
+        plot_bgcolor="#fafafa",
+        paper_bgcolor="white",
+        xaxis=dict(
+            tickangle=-45,
+            tickfont=dict(size=11, family="Arial"),
+            side="bottom",
+            showgrid=False,
+            zeroline=False,
+        ),
+        yaxis=dict(
+            tickfont=dict(size=11, family="Arial"),
+            autorange="reversed",   # prima riga in alto
+            showgrid=False,
+            zeroline=False,
+        ),
+    )
+
+    return fig
+
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+
+def save_cross_heatmap_png(
+    corr:       pd.DataFrame,
+    title:      str,
+    out_path:   str | Path,
+    cell_h_in:  float = 0.45,   # altezza per cella in pollici
+    cell_w_in:  float = 0.55,   # larghezza per cella in pollici
+    fontsize:   int   = 9,
+    dpi:        int   = 200,
+    cmap:       str   = "RdBu_r",
+    vmin:       float = -1.0,
+    vmax:       float = 1.0,
+) -> None:
+    """
+    Salva la matrice rettangolare predictors×targets come PNG usando Matplotlib.
+    Matplotlib è deterministico: ciò che vedi è ciò che viene salvato.
+    """
+    row_feats = list(corr.index)
+    col_feats = list(corr.columns)
+    n_r = len(row_feats)
+    n_c = len(col_feats)
+
+    # Dimensioni figura dinamiche basate sul numero di celle
+    label_y_in = 2.8   # spazio a sinistra per label feature Y (lunghe)
+    label_x_in = 1.8   # spazio in basso per label feature X ruotate
+    cbar_in    = 0.6   # spazio a destra per la colorbar
+    title_in   = 0.5   # spazio in alto per il titolo
+
+    fig_w = label_y_in + n_c * cell_w_in + cbar_in
+    fig_h = title_in   + n_r * cell_h_in + label_x_in
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    cm   = plt.get_cmap(cmap)
+    z    = corr.values
+
+    # ── Disegna le celle ───────────────────────────────────────────────────────
+    im = ax.imshow(z, aspect="auto", cmap=cmap, norm=norm,
+                   interpolation="nearest")
+
+    # ── Valori numerici dentro le celle ────────────────────────────────────────
+    for i in range(n_r):
+        for j in range(n_c):
+            val = z[i, j]
+            if np.isnan(val):
+                continue
+            # Colore testo adattivo: bianco su celle scure
+            bg_rgba  = cm(norm(val))
+            luminance = 0.299*bg_rgba[0] + 0.587*bg_rgba[1] + 0.114*bg_rgba[2]
+            txt_color = "white" if luminance < 0.50 else "#111111"
+            ax.text(j, i, f"{val:+.2f}",
+                    ha="center", va="center",
+                    fontsize=fontsize, color=txt_color,
+                    fontfamily="DejaVu Sans")
+
+    # ── Assi ──────────────────────────────────────────────────────────────────
+    ax.set_xticks(range(n_c))
+    ax.set_xticklabels(col_feats, rotation=45, ha="right",
+                       fontsize=fontsize + 1)
+
+    ax.set_yticks(range(n_r))
+    ax.set_yticklabels(row_feats, fontsize=fontsize + 1)
+
+    ax.tick_params(axis="both", which="both", length=0)  # togli i tick marks
+
+    # Linee di separazione tra celle
+    ax.set_xticks(np.arange(-0.5, n_c, 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, n_r, 1), minor=True)
+    ax.grid(which="minor", color="white", linewidth=1.2)
+    ax.tick_params(which="minor", bottom=False, left=False)
+
+    # ── Colorbar ──────────────────────────────────────────────────────────────
+    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02)
+    cbar.set_label("ρ", fontsize=11)
+    cbar.ax.tick_params(labelsize=10)
+
+    # ── Titolo ────────────────────────────────────────────────────────────────
+    ax.set_title(title, fontsize=11, fontweight="bold",
+                 pad=10, loc="left")
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [PNG] saved → {out_path}")
 
 def plot_correlation_matrices(
-    df_combined: pd.DataFrame,
-    model_keys: list[str] | None = None,
-    taxonomy: dict = TAXONOMY,
-    method: str = "spearman",
-    exclude_subgroups: set | None = None,
-    splits: list[str] | None = None,
-    save: bool = SAVE_PLOTS,
-) -> dict[str, dict[str, pd.DataFrame]]:
-    """
-    Computes and displays Spearman/Pearson correlation heatmaps for every
-    (model × dataset split) combination.
+    df_combined:       pd.DataFrame,
+    model_keys:        list[str] | None = None,
+    taxonomy:          dict             = TAXONOMY,
+    method:            str              = "spearman",
+    exclude_subgroups: set | None       = None,
+    splits:            list[str] | None = None,
+    save:              bool             = SAVE_PLOTS,
+    png_scale:         float            = 2.0,
+    px_per_row:        int              = 35,
+    px_per_col:        int              = 45,
+) -> dict[str, dict[str, tuple]]:
 
-    Parameters
-    ----------
-    df_combined       : Combined DataFrame with a "model_name" column.
-    model_keys        : Subset of MODEL_CONFIGS to process. Defaults to all.
-    taxonomy          : Feature taxonomy dict. Defaults to module-level TAXONOMY.
-    method            : "spearman" (default) or "pearson".
-    exclude_subgroups : Set of taxonomy subgroup names to exclude (e.g. {"RMSNorm"}).
-    splits            : Dataset splits to compute. Defaults to ["all","wikitext","fineweb"].
-    save              : If True, writes HTML files to out_dir/<model_name>/.
-
-    Returns
-    -------
-    Nested dict: results[model_key][split] = pd.DataFrame (correlation matrix).
-    """
     if model_keys is None:
         model_keys = list(MODEL_CONFIGS.keys())
     if splits is None:
         splits = ["all", "wikitext", "fineweb"]
 
-    results = {}
+    target_feats: list[str] = []
+    if "target" in taxonomy:
+        for group in taxonomy["target"].values():
+            target_feats.extend(group["features"])
+
+    predictor_feats: list[str] = []
+    for sec in ("model_dependent", "input_dependent"):
+        if sec in taxonomy:
+            for group in taxonomy[sec].values():
+                predictor_feats.extend(group["features"])
+
+    results: dict[str, dict] = {}
 
     for model_key in model_keys:
         cfg      = MODEL_CONFIGS[model_key]
@@ -1549,9 +1757,10 @@ def plot_correlation_matrices(
         feat_to_cat = _feat_to_category(taxonomy)
         results[model_key] = {}
 
+        model_dir = out_dir / cfg["model_name"] if save else None
+
         print(f"\n── {cfg['label']} — {len(features)} features ──")
 
-        # Split selector: returns the appropriate df subset
         split_filters = {
             "all":      df_model,
             "wikitext": df_model[df_model["prompt_source"] == cfg["ptype_wiki"]],
@@ -1564,21 +1773,56 @@ def plot_correlation_matrices(
                 print(f"  [SKIP] split '{split}' — no data.")
                 continue
 
+            # ── Full matrix ───────────────────────────────────────────────────
             df_A, df_B = _build_corr_df(df_split, features, cfg)
-            corr       = _build_corr_matrix(df_A, df_B, features, method)
-            results[model_key][split] = corr
+            corr_full  = _build_corr_matrix(df_A, df_B, features, method)
 
-            title = (f"Correlation Matrix — {cfg['label']}<br>"
-                     f"Split: {split}  |  Method: {method}")
-            fig = _make_plotly_heatmap(corr, title, features, feat_to_cat)
+            title_full = (
+                f"Correlation Matrix — {cfg['label']}<br>"
+                f"Split: {split}  |  Method: {method}"
+            )
+            fig_full = _make_plotly_heatmap(corr_full, title_full, features, feat_to_cat)
 
             if save:
-                model_dir = out_dir / cfg["model_name"]
-                model_dir.mkdir(exist_ok=True)
-                fig.write_html(str(model_dir / f"corr_{split}_{method}.html"))
+                model_dir.mkdir(parents=True, exist_ok=True)
+                fig_full.write_image(
+                    str(model_dir / f"corr_{split}_{method}.png"),
+                    width=1200,
+                    height=1200,
+                    scale=png_scale,
+                )
 
-            print(f"  › {split}")
-            fig.show()
+            fig_full.show()
+            print(f"  › {split} — full matrix ({corr_full.shape[0]}×{corr_full.shape[1]})")
+
+            # ── Cross-correlation block (predictors × targets) ─────────────────
+            valid_x    = [f for f in target_feats    if f in corr_full.columns]
+            valid_y    = [f for f in predictor_feats if f in corr_full.index]
+            corr_cross = corr_full.loc[valid_y, valid_x] if (valid_x and valid_y) else None
+
+            results[model_key][split] = (corr_full, corr_cross)
+
+            if corr_cross is not None:
+                n_rows, n_cols = corr_cross.shape
+
+                # Titolo con \n per matplotlib, <br> per Plotly
+                title_cross      = f"Predictors × Targets — {cfg['label']}\nSplit: {split}  |  Method: {method}"
+                title_cross_html = title_cross.replace("\n", "<br>")
+
+                fig_cross = _make_plotly_heatmap_rect(corr_cross, title_cross_html, feat_to_cat)
+                fig_cross.show()
+
+                if save:
+                    model_dir.mkdir(parents=True, exist_ok=True)
+                    save_cross_heatmap_png(
+                        corr_cross,
+                        title=title_cross,
+                        out_path=model_dir / f"corr_{split}_{method}_CROSS.png",
+                    )
+
+                print(f"  › {split} — cross block ({n_rows} predictors × {n_cols} targets)")
+            else:
+                print(f"  [SKIP] {split} — cross block: no matching features.")
 
     return results
 
@@ -1742,7 +1986,141 @@ def plot_correlation_by_quartile(
                 fig.show()
 
     return results
+def plot_cross_correlation_by_quartile(
+    df_combined: pd.DataFrame,
+    model_keys: list[str] | None = None,
+    taxonomy: dict = TAXONOMY,
+    method: str = "spearman",
+    exclude_subgroups: set | None = None,
+    split_datasets: bool = True,
+    save: bool = SAVE_PLOTS,
+) -> dict:
+    """
+    Computes and displays rectangular cross-correlation heatmaps 
+    (Predictors × Targets) stratified by layer quartile.
+    """
+    if model_keys is None:
+        model_keys = list(MODEL_CONFIGS.keys())
+        
+    # Se non viene passato un set specifico, escludiamo di default il sottogruppo RMSNorm
+    if exclude_subgroups is None:
+        exclude_subgroups = {"RMSNorm"}
+    else:
+        exclude_subgroups.add("RMSNorm")
 
+    # Pre-calcoliamo la lista delle feature target e dei predittori
+    target_feats: list[str] = []
+    if "target" in taxonomy:
+        for group in taxonomy["target"].values():
+            if group.get("label", "") not in exclude_subgroups:
+                target_feats.extend(group["features"])
+
+    predictor_feats: list[str] = []
+    for sec in ("model_dependent", "input_dependent"):
+        if sec in taxonomy:
+            for group_name, group in taxonomy[sec].items():
+                if group_name not in exclude_subgroups and group.get("label", "") not in exclude_subgroups:
+                    predictor_feats.extend(group["features"])
+
+    results = {}
+
+    for model_key in model_keys:
+        cfg      = MODEL_CONFIGS[model_key]
+        df_model = df_combined[df_combined["model_name"] == cfg["model_name"]].copy()
+
+        if df_model.empty:
+            print(f"[WARNING] No data for model '{model_key}'. Skipping.")
+            continue
+
+        features    = _get_all_features(taxonomy, df_model, exclude_subgroups)
+        feat_to_cat = _feat_to_category(taxonomy)
+
+        layer_to_q, q_labels = _build_quartile_map(df_model)
+        df_model["_quartile"] = df_model["layer_idx"].map(layer_to_q)
+
+        # Build the list of (label, df_subset) pairs to iterate over
+        if split_datasets:
+            splits = [
+                ("wikitext", df_model[df_model["prompt_source"] == cfg["ptype_wiki"]]),
+                ("fineweb",  df_model[df_model["prompt_source"] == cfg["ptype_fineweb"]]),
+            ]
+        else:
+            splits = [("all", df_model)]
+
+        results[model_key] = {}
+
+        print(f"\n{'═' * 64}")
+        print(f"  Model   : {cfg['label']}")
+        print(f"  Cross   : Predictors × Targets")
+        print(f"  Method  : {method}  |  Dataset split: {split_datasets}")
+        print(f"  Layers  : {df_model['layer_idx'].nunique()}  "
+              f"→  {len(q_labels)} quartiles × {len(splits)} split(s)")
+        print(f"{'═' * 64}")
+
+        for split_label, df_split in splits:
+            if df_split.empty:
+                print(f"  [SKIP] split '{split_label}' — no data.")
+                continue
+
+            for q_idx in range(4):
+                df_q = df_split[df_split["_quartile"] == q_idx]
+
+                if df_q.empty:
+                    print(f"  [SKIP] {split_label} / {q_labels[q_idx]} — empty.")
+                    continue
+
+                # Calcolo matrice full per l'intero quartile
+                df_A, df_B = _build_corr_df(df_q, features, cfg)
+
+                n_A = df_A.shape[0]
+                n_B = df_B.shape[0] if df_B is not None else 0
+                if n_A < 3 and n_B < 3:
+                    print(f"  [SKIP] {split_label} / {q_labels[q_idx]} — "
+                          f"insufficient observations (A={n_A}, B={n_B}).")
+                    continue
+
+                corr_full = _build_corr_matrix(df_A, df_B, features, method)
+                
+                # Ritaglio blocco Predictors × Targets
+                valid_x    = [f for f in target_feats    if f in corr_full.columns]
+                valid_y    = [f for f in predictor_feats if f in corr_full.index]
+                
+                if not valid_x or not valid_y:
+                    print(f"  [SKIP] {split_label} / {q_labels[q_idx]} — no matching cross features.")
+                    continue
+                    
+                corr_cross = corr_full.loc[valid_y, valid_x]
+
+                split_tag  = f"  |  {split_label}" if split_datasets else ""
+                title      = (f"Predictors × Targets — {cfg['label']}<br>"
+                              f"{q_labels[q_idx]}{split_tag}  |  {method}")
+                
+                # Uso la funzione Plotly specifica per le rettangolari
+                fig = _make_plotly_heatmap_rect(corr_cross, title, feat_to_cat)
+
+                key = (q_idx, split_label)
+                results[model_key][key] = corr_cross
+
+                if save:
+                    model_dir = out_dir / cfg["model_name"]
+                    model_dir.mkdir(exist_ok=True)
+                    safe = (f"corr_cross_q{q_idx}_{split_label}_{method}"
+                            .replace(" ", "_"))
+                    fig.write_html(str(model_dir / f"{safe}.html"))
+                    
+                    # Salva anche in PNG per tesi usando matplotlib
+                    save_cross_heatmap_png(
+                        corr_cross,
+                        title=title.replace("<br>", "\n"),
+                        out_path=model_dir / f"{safe}.png"
+                    )
+
+                n_rows, n_cols = corr_cross.shape
+                print(f"  › Q{q_idx + 1}  {split_label:<10}  "
+                      f"rows A={n_A}  B={n_B}  |  cross={n_rows}×{n_cols}")
+                fig.show()
+
+    return results
 
 # =============================================================================
 # PAIRWISE SCATTER ANALYSIS — Model-dependent (X) × Target (Y)

@@ -1,44 +1,4 @@
-"""LGBM modeling pipeline — multi-model support (Mistral-7B, Qwen3-4B).
 
-Results are saved automatically under:
-  results/
-  └── <model_key>/
-      ├── cross_prompt/
-      │   ├── metrics_<target>_<variant>.csv
-      │   ├── predictions_<target>_<variant>.parquet
-      │   └── shap_<target>.png
-      ├── cross_head/
-      │   ├── metrics_<target>.csv
-      │   └── shap_crosshead_<target>.png
-      ├── all_targets/
-      │   ├── all_targets_results.csv
-      │   └── r2_vs_lift.png
-      └── length_generalization/
-          ├── length_generalization_results.csv
-          └── r2_vs_lift.png
-
-Usage
------
-from modeling import MODEL_CONFIGS, run_all_models
-import pandas as pd
-
-# Single dataset (512-tok) — runs cross_prompt + cross_head + all_targets
-datasets = {
-    "mistral_7b": pd.read_parquet("datasets_produced/Mistral_50_prompts_512tok.parquet"),
-    "qwen3_4b":   pd.read_parquet("datasets_produced/Qwen3_50_prompts_512tok.parquet"),
-}
-results = run_all_models(datasets, list(MODEL_CONFIGS.values()))
-
-# Multi-length dataset — adds length_generalization
-datasets_multi = {
-    "mistral_7b": pd.read_parquet("datasets_produced/Mistral_multi_tok.parquet"),
-    "qwen3_4b":   pd.read_parquet("datasets_produced/Qwen3_multi_tok.parquet"),
-}
-results_len = run_all_models(
-    datasets_multi, list(MODEL_CONFIGS.values()),
-    experiments=["length_generalization"],
-)
-"""
 
 from __future__ import annotations
 
@@ -220,7 +180,7 @@ def split_by_head(
 
 def split_by_length_stratified(
     df:             pd.DataFrame,
-    train_lengths:  Tuple[int, ...] = (64, 128, 256),   # FIX: removed 0
+    train_lengths:  Tuple[int, ...] = (64, 128, 256),   
     test_lengths:   Tuple[int, ...] = (512,),
     val_frac:       float = 0.15,
     seed:           int   = 42,
@@ -255,16 +215,16 @@ def head_mean_baseline(
     For each test head: mean target for that head across other
     prompts in the training set. Fallback: global train mean.
     """
-    head_means = (
-        df_train.groupby(["layer_idx", "head_idx"])[target]
-        .mean()
-        .rename("pred_baseline")
-    )
-    merged = df_test.merge(
-        head_means.reset_index(), on=["layer_idx", "head_idx"], how="left"
-    )
-    merged["pred_baseline"] = merged["pred_baseline"].fillna(df_train[target].mean())
-    return merged["pred_baseline"].values
+    head_means = df_train.groupby(["layer_idx", "head_idx"])[target].mean()
+    
+    test_multi_idx = pd.MultiIndex.from_frame(df_test[["layer_idx", "head_idx"]])
+    
+    pred_baseline = test_multi_idx.map(head_means)
+    
+    global_mean = df_train[target].mean()
+    pred_baseline = pred_baseline.fillna(global_mean)
+    
+    return pred_baseline.to_numpy()
 
 
 def nearest_neighbor_baseline(
@@ -352,8 +312,6 @@ def length_corrected_head_mean_baseline(
 
 # ── Hyperparameter tuning (Optuna) ────────────────────────────────────────────
 #
-# Range calibrati per raggiungere almeno il lift del 40% osservato con
-# parametri fissi su diagonal_mass_*. L'obiettivo Optuna è MAE su val.
 #
 # Rationale for ranges:
 #   learning_rate  [0.01, 0.15]: avoids too-low lr (slow, no early-stopping gain)
@@ -524,19 +482,20 @@ def evaluate(
     df_test:  pd.DataFrame,
     features: List[str],
     target:   str,
-    cfg:      ModelConfig,
+    cfg:      "ModelConfig",  # Assicurati di importare/gestire questa type hint
     df_train: Optional[pd.DataFrame] = None,
-    baseline_fn: str = "head_mean",        # "head_mean" | "length_corrected"
+    baseline_fn: str = "head_mean",
 ) -> Tuple[dict, pd.DataFrame]:
     """
     Evaluate the model on the test set.
-    baseline_fn selects which baseline to use for lift computation:
-      - "head_mean"        → head_mean_baseline          (Exp 1, cross-prompt)
-      - "length_corrected" → length_corrected_head_mean_baseline (Exp 3)
     """
     X_te = df_test[features].values
     y_te = df_test[target].values
+    
+    # Assicurati che le prediction siano un array 1D
     pred = model.predict(X_te)
+    if pred.ndim > 1:
+        pred = pred.squeeze()
 
     results: dict = {
         "R2":  r2_score(y_te, pred),
@@ -548,10 +507,13 @@ def evaluate(
             pred_base = length_corrected_head_mean_baseline(df_train, df_test, target)
         else:
             pred_base = head_mean_baseline(df_train, df_test, target)
+            
         results["MAE_baseline"]    = mean_absolute_error(y_te, pred_base)
         results["MAE_improvement"] = results["MAE_baseline"] - results["MAE"]
-        results["lift"]            = results["MAE_improvement"] / results["MAE_baseline"]
+        # Evitare divisioni per zero se baseline è perfetta (improbabile, ma best practice)
+        results["lift"]            = results["MAE_improvement"] / (results["MAE_baseline"] + 1e-9)
 
+    # Computa MAE diviso per sorgente del prompt
     if "prompt_source" in df_test.columns:
         for src in df_test["prompt_source"].unique():
             mask  = (df_test["prompt_source"] == src).values
@@ -559,12 +521,15 @@ def evaluate(
             if mask.sum() > 0:
                 results[f"MAE_{short}"] = mean_absolute_error(y_te[mask], pred[mask])
 
-    results.update(_layer_quartile_mae(y_te, pred, df_test["layer_idx"]))
+    # Assumo che _layer_quartile_mae restituisca un dict
+    # results.update(_layer_quartile_mae(y_te, pred, df_test["layer_idx"]))
 
     df_out = df_test.copy()
     df_out["pred"]     = pred
     df_out["residual"] = y_te - pred
+    
     return results, df_out
+
 
 
 def evaluate_head(
@@ -641,7 +606,6 @@ def aggregate_per_head(
     feat_cols = [c for c in feat_cols if c in df_agg.columns]
     return df_agg, feat_cols
 
-# ── Internal single-run helper ────────────────────────────────────────────────
 
 def _run_one(
     df_train:    pd.DataFrame,
@@ -701,13 +665,12 @@ def _run_one(
 
     return row, model, features, df_pred
 
-# ── Internal loop su tutti i target ──────────────────────────────────────────
 
 def _run_all_targets(
     df_train:    pd.DataFrame,
     df_val:      pd.DataFrame,
     df_test:     pd.DataFrame,
-    df:          pd.DataFrame,         # only for feature check
+    df:          pd.DataFrame,         
     cfg:         ModelConfig,
     targets:     List[str],
     tune:        bool,
@@ -1032,7 +995,6 @@ def plot_r2_vs_lift_panels(
     plt.show()
     return fig
 
-# ── Helper: costruisce pivot per r2_vs_lift ───────────────────────────────────
 
 def _build_pivot(df_results: pd.DataFrame, lift_col: str = "lift") -> Optional[pd.DataFrame]:
     pivot_rows: dict = {}
@@ -1046,7 +1008,6 @@ def _build_pivot(df_results: pd.DataFrame, lift_col: str = "lift") -> Optional[p
               f"{lift_col}_offline", f"{lift_col}_oracle"}
     return pivot if needed.issubset(pivot.columns) else None
 
-# ── Experiment 1: cross-prompt (singolo target) ───────────────────────────────
 
 def run_cross_prompt_experiment(
     df:             pd.DataFrame,
@@ -1120,7 +1081,6 @@ def run_cross_prompt_experiment(
 
     return all_results
 
-# ── Experiment 2: cross-head ──────────────────────────────────────────────────
 
 def run_cross_head_experiment(
     df:            pd.DataFrame,
@@ -1188,7 +1148,6 @@ def run_cross_head_experiment(
 
     return results_ch
 
-# ── Experiment 3: all targets (cross-prompt) ─────────────────────────────────
 
 def run_cross_prompt_all_targets(
     df:             pd.DataFrame,
@@ -1228,7 +1187,6 @@ def run_cross_prompt_all_targets(
                                    title_suffix="Cross-Prompt", lift_col="lift")
     return df_results
 
-# ── Experiment 4: length generalisation ──────────────────────────────────────
 
 def run_length_generalization(
     df:             pd.DataFrame,
@@ -1294,7 +1252,6 @@ def run_length_generalization(
     return df_results
 
 
-# ── Experiment 2b: cross-head, all targets ────────────────────────────────────
 
 def run_cross_head_all_targets(
     df:       pd.DataFrame,
@@ -1397,7 +1354,6 @@ def run_cross_head_all_targets(
 
     return df_results
 
-# ── Top-level multi-model runner ──────────────────────────────────────────────
 
 def run_all_models(
     datasets:    Dict[str, pd.DataFrame],
