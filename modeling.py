@@ -82,15 +82,18 @@ MODEL_CONFIGS: Dict[str, ModelConfig] = {
         n_heads       = 32,
         n_kv_heads    = 8,
     ),
-    "qwen3_4b": ModelConfig(
-        key           = "qwen3_4b",
-        label         = "Qwen3-4B",
-        ptype_wiki    = "wikitext_wikitext-103-raw-v1_train",
-        ptype_fineweb = "fineweb-edu_sample-10BT_train_stream",
-        gqa_ratio     = 4,
-        n_heads       = 32,
-        n_kv_heads    = 8,
-    ),
+    
+    
+    # "qwen3_4b": ModelConfig(
+    #     key           = "qwen3_4b",
+    #     label         = "Qwen3-4B",
+    #     ptype_wiki    = "wikitext_wikitext-103-raw-v1_train",
+    #     ptype_fineweb = "fineweb-edu_sample-10BT_train_stream",
+    #     gqa_ratio     = 4,
+    #     n_heads       = 32,
+    #     n_kv_heads    = 8,
+    # ),
+    
 }
 
 # ── Feature / target taxonomy ─────────────────────────────────────────────────
@@ -1361,7 +1364,7 @@ def run_all_models(
     experiments: List[str] = ["cross_prompt", "cross_head", "all_targets",
                                "length_generalization"],
     tune:        bool  = True,
-    n_trials:    int   = 10,
+    n_trials:    int   = 3,
     seed:        int   = 42,
     out_dir:     Path  = Path("results"),
 ) -> Dict[str, dict]:
