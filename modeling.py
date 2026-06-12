@@ -365,6 +365,7 @@ def _lgbm_objective(
         valid_sets=[dval],
         callbacks=[lgb.early_stopping(60, verbose=False), lgb.log_evaluation(-1)],
     )
+    trial.set_user_attr("model", model)
     return mean_absolute_error(y_va, model.predict(X_va))
 
 
@@ -375,8 +376,15 @@ def tune_lgbm(
     target:   str,
     n_trials: int = 10,
     seed:     int = 42,
-) -> dict:
-    """Return best hyperparameters found by Optuna TPE."""
+) -> Tuple[dict, lgb.Booster]:
+    """
+    Run Optuna TPE search and return (best_params, best_model).
+
+    The best model is the one trained during the winning trial — no
+    re-training is performed.  Every trial stores its booster via
+    trial.set_user_attr("model", ...) so the best trial's model is
+    immediately available after optimisation.
+    """
     study = optuna.create_study(
         direction="minimize",
         sampler=optuna.samplers.TPESampler(seed=seed),
@@ -386,7 +394,8 @@ def tune_lgbm(
         n_trials=n_trials,
         show_progress_bar=False,
     )
-    return study.best_params
+    best_model  = study.best_trial.user_attrs["model"]
+    return study.best_params, best_model
 
 # ── Training ──────────────────────────────────────────────────────────────────
 
@@ -653,6 +662,7 @@ def _run_one(
     cfg:         ModelConfig,
     best_params: Optional[dict] = None,
     baseline_fn: str = "head_mean",
+    model:       Optional[lgb.Booster] = None,
 ) -> Optional[Tuple[dict, lgb.Booster, List[str], pd.DataFrame]]:
     if target not in df_train.columns:
         return None
@@ -662,7 +672,10 @@ def _run_one(
     if len(df_tr) < 50 or len(df_te) < 10:
         return None
 
-    model  = train_lgbm(df_tr, df_va, features, target, params_override=best_params)
+    # If a pre-trained model is supplied (e.g. the best Optuna trial model),
+    # reuse it directly — no redundant re-training.
+    if model is None:
+        model = train_lgbm(df_tr, df_va, features, target, params_override=best_params)
     y_te   = df_te[target].values
     pred   = model.predict(df_te[features].values)
 
@@ -727,6 +740,7 @@ def _run_all_targets(
     for target in valid_targets:
         # Separate tuning per variant
         best_params_per_variant: Dict[str, Optional[dict]] = {v: None for v in FEATURE_SETS}
+        best_model_per_variant:  Dict[str, Optional[lgb.Booster]] = {v: None for v in FEATURE_SETS}
         if tune:
             for var_name, features in FEATURE_SETS.items():
                 feats_avail = [f for f in features if f in df.columns]
@@ -736,8 +750,10 @@ def _run_all_targets(
                     continue
                 print(f"     Optuna [{var_name}] {target} ({n_trials} trials)...",
                       end=" ", flush=True)
-                best_params_per_variant[var_name] = tune_lgbm(
+                best_params, best_model = tune_lgbm(
                     df_tr_clean, df_va_clean, feats_avail, target, n_trials, seed)
+                best_params_per_variant[var_name] = best_params
+                best_model_per_variant[var_name]  = best_model
                 print("done.")
 
             # Save best_params to disk after tuning all variants for this target
@@ -758,6 +774,7 @@ def _run_all_targets(
                 feats_avail, target, var_name, cfg,
                 best_params=best_params_per_variant.get(var_name),
                 baseline_fn=baseline_fn,
+                model=best_model_per_variant.get(var_name),
             )
             if result is None:
                 print("SKIP"); continue
@@ -1024,11 +1041,11 @@ def run_cross_prompt_experiment(
         best_params = None
         if tune:
             print(f"     Optuna tuning ({n_trials} trials)...", end=" ", flush=True)
-            best_params = tune_lgbm(df_train, df_val, feats, target, n_trials, seed)
+            best_params, model = tune_lgbm(df_train, df_val, feats, target, n_trials, seed)
             print("done.")
+        else:
+            model = train_lgbm(df_train, df_val, feats, target, seed=seed)
 
-        model = train_lgbm(df_train, df_val, feats, target,
-                           params_override=best_params, seed=seed)
         metrics, df_pred = evaluate(model, df_test, feats, target, cfg,
                                     df_train=df_train, baseline_fn="head_mean")
 
@@ -1099,12 +1116,16 @@ def run_cross_head_experiment(
         best_params = None
         if tune:
             print(f"     Optuna tuning ({n_trials} trials)...", end=" ", flush=True)
-            best_params = tune_lgbm(df_tr, df_va, feat_cols,
-                                    "target_median", n_trials, seed)
+            best_params, _ = tune_lgbm(df_tr, df_va, feat_cols,
+                                       "target_median", n_trials, seed)
             print("done.")
+            # Re-train with train_lgbm_head: uses small-dataset defaults
+            # (num_leaves=15, min_child_samples=3) combined with Optuna best_params.
+            model, feats_used = train_lgbm_head(df_tr, df_va, feat_cols,
+                                                 params_override=best_params, seed=seed)
+        else:
+            model, feats_used = train_lgbm_head(df_tr, df_va, feat_cols, seed=seed)
 
-        model, feats_used = train_lgbm_head(df_tr, df_va, feat_cols,
-                                             params_override=best_params, seed=seed)
         metrics, df_pred  = evaluate_head(model, feats_used, df_tr, df_te,
                                           label=f"CH/{var_name}")
 
@@ -1480,11 +1501,11 @@ def run_cross_head_raw_experiment(
         best_params = None
         if tune:
             print(f"  Optuna tuning ({n_trials} trials)...", end=" ", flush=True)
-            best_params = tune_lgbm(df_train, df_val, feats, target, n_trials, seed)
+            best_params, model = tune_lgbm(df_train, df_val, feats, target, n_trials, seed)
             print("done.")
+        else:
+            model = train_lgbm(df_train, df_val, feats, target, seed=seed)
 
-        model   = train_lgbm(df_train, df_val, feats, target,
-                             params_override=best_params, seed=seed)
         y_te    = df_test[target].values
         pred    = model.predict(df_test[feats].values)
         pred_nn = nn_baseline_raw(df_train, df_test, feats, target)
@@ -1592,7 +1613,8 @@ def run_cross_head_raw_all_targets(
           f" | test: {len(df_test):,}\n")
 
     for target in valid_targets:
-        best_params_per_variant: Dict[str, Optional[dict]] = {v: None for v in FEATURE_SETS}
+        best_params_per_variant: Dict[str, Optional[dict]]       = {v: None for v in FEATURE_SETS}
+        best_model_per_variant:  Dict[str, Optional[lgb.Booster]] = {v: None for v in FEATURE_SETS}
 
         if tune:
             for var_name, features in FEATURE_SETS.items():
@@ -1603,8 +1625,10 @@ def run_cross_head_raw_all_targets(
                     continue
                 print(f"  Optuna [CHR/{var_name}] {target} ({n_trials} trials)...",
                       end=" ", flush=True)
-                best_params_per_variant[var_name] = tune_lgbm(
+                best_params, best_model = tune_lgbm(
                     df_tr_clean, df_va_clean, feats_avail, target, n_trials, seed)
+                best_params_per_variant[var_name] = best_params
+                best_model_per_variant[var_name]  = best_model
                 print("done.")
 
             if out_dir_exp is not None:
@@ -1625,9 +1649,10 @@ def run_cross_head_raw_all_targets(
             if len(df_tr) < 50 or len(df_te) < 10:
                 print("SKIP"); continue
 
-            model   = train_lgbm(df_tr, df_va, feats_avail, target,
-                                 params_override=best_params_per_variant.get(var_name),
-                                 seed=seed)
+            model = best_model_per_variant.get(var_name) or train_lgbm(
+                df_tr, df_va, feats_avail, target,
+                params_override=best_params_per_variant.get(var_name), seed=seed,
+            )
             y_te    = df_te[target].values
             pred    = model.predict(df_te[feats_avail].values)
             pred_nn = nn_baseline_raw(df_tr, df_te, feats_avail, target)
