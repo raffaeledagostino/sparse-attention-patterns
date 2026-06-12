@@ -13,7 +13,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import optuna
 import pandas as pd
-import shap
 from sklearn.metrics import mean_absolute_error, r2_score
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -776,24 +775,7 @@ def _run_all_targets(
                 "df_train":   df_train,
                 "best_params": best_params_per_variant.get(var_name),
             }
-            # Compute and store SHAP feature-importance for this run.
-            if out_dir is not None:
-                df_shap = _compute_shap_importance(
-                    model=model,
-                    feats=feats,
-                    df_pred=df_pred,
-                    target=target,
-                    var_name=var_name,
-                    exp_tag=exp_tag,
-                )
-                if "shap_dfs" not in locals(): shap_dfs = []
-                shap_dfs.append(df_shap)
             print(f"R²={row['R2']:.4f}  MAE={row['MAE']:.5f}  lift={row['lift']:+.1%}")
-
-    if out_dir is not None and locals().get("shap_dfs"):
-        df_shap_all = pd.concat(shap_dfs, ignore_index=True)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        _save_csv(df_shap_all, out_dir / "all_targets_shap.csv")
 
     if not rows:
         return pd.DataFrame(
@@ -806,192 +788,6 @@ def _run_all_targets(
     )
 
 # ── Plot helpers ──────────────────────────────────────────────────────────────
-
-def _compute_shap_importance(
-    model:         lgb.Booster,
-    feats:         List[str],
-    df_pred:       pd.DataFrame,
-    target:        str,
-    var_name:      str,
-    exp_tag:       str,
-    max_shap_rows: int = 500,
-) -> pd.DataFrame:
-    """
-    Compute mean |SHAP| values on a subsample of df_pred and return as a DataFrame.
-    Much faster than plotting. Subsampled for speed.
-    """
-    n = len(df_pred)
-    if n > max_shap_rows:
-        rng   = np.random.default_rng(42)
-        idx   = rng.choice(n, size=max_shap_rows, replace=False)
-        X     = df_pred[feats].fillna(0).iloc[idx].values
-    else:
-        X     = df_pred[feats].fillna(0).values
-
-    explainer = shap.TreeExplainer(model)
-    shap_vals = explainer.shap_values(X)
-    mean_shap = np.abs(shap_vals).mean(axis=0)
-
-    # Sort descending
-    order = np.argsort(mean_shap)[::-1]
-
-    return pd.DataFrame({
-        "exp_tag":       exp_tag,
-        "target":        target,
-        "variant":       var_name,
-        "feature":       [feats[i] for i in order],
-        "mean_abs_shap": mean_shap[order],
-        "rank":          np.arange(1, len(feats) + 1),
-    })
-
-
-def plot_top_features(
-    results_cp: dict,
-    cfg:        ModelConfig,
-    target:     str,
-    out_dir:    Optional[Path] = None,
-    top_n:      int = 15,
-) -> plt.Figure:
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
-    for ax, (var_name, res) in zip(axes, results_cp.items()):
-        model    = res["model"]
-        features = res["features"]
-        df_pred  = res["predictions"]
-        explainer = shap.TreeExplainer(model)
-        shap_vals = explainer.shap_values(df_pred[features].values)
-        mean_shap = np.abs(shap_vals).mean(axis=0)
-        order     = np.argsort(mean_shap)[::-1][:top_n]
-        feat_ord  = [features[i] for i in order]
-        shap_ord  = mean_shap[order]
-        colors    = [C_MODDEP if f in MODEL_DEP_FEATURES else C_INPUTDEP for f in feat_ord]
-        ax.barh(range(len(feat_ord))[::-1], shap_ord,
-                color=colors, alpha=0.88, edgecolor="none", height=0.65)
-        ax.set_yticks(range(len(feat_ord))[::-1])
-        ax.set_yticklabels(feat_ord, fontsize=9)
-        ax.set_xlabel("Mean |SHAP value|", fontsize=9)
-        m = res["metrics"]
-        ax.set_title(
-            f"Variant: {var_name}\n"
-            f"R²={m['R2']:.4f}  MAE={m['MAE']:.5f}",
-            fontsize=10, fontweight="bold",
-        )
-        ax.grid(axis="x", lw=0.4, alpha=0.5)
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.legend(handles=[
-            mpatches.Patch(facecolor=C_MODDEP,   label="model-dependent"),
-            mpatches.Patch(facecolor=C_INPUTDEP, label="input-dependent"),
-        ], fontsize=8, loc="upper left")
-    fig.suptitle(
-        f"Top feature importance — Cross-Prompt\n"
-        f"Target: {target} | Model: {cfg.label}",
-        fontsize=11, fontweight="bold",
-    )
-    if out_dir is not None:
-        _savefig(fig, out_dir / f"shap_{_safe_name(target)}.png")
-    plt.show()
-    return fig
-
-
-def plot_shap_run(
-    target:  str,
-    variant: str = "oracle",
-    exp_tag: str = "cross_prompt",
-    cfg:     Optional[ModelConfig] = None,
-    out_dir: Optional[Path] = None,
-    top_n:   int = 15,
-) -> Optional[plt.Figure]:
-    model_key = cfg.key if cfg else list(MODEL_CONFIGS.keys())[0]
-    key = (exp_tag, model_key, target, variant)
-    if key not in _RUN_CACHE:
-        print(f"Run {key} not in cache. Available: {list(_RUN_CACHE.keys())}")
-        return None
-    cache     = _RUN_CACHE[key]
-    model     = cache["model"]
-    feats     = cache["feats"]
-    df_te     = cache["df_pred"]
-    X         = df_te[feats].fillna(0).values
-    explainer = shap.TreeExplainer(model)
-    shap_vals = explainer.shap_values(X)
-    mean_shap = np.abs(shap_vals).mean(axis=0)
-    order     = np.argsort(mean_shap)[::-1][:top_n]
-    feat_ord  = [feats[i] for i in order]
-    shap_ord  = mean_shap[order]
-    colors    = [C_MODDEP if f in MODEL_DEP_FEATURES else C_INPUTDEP for f in feat_ord]
-    fig, ax   = plt.subplots(figsize=(7, 5), constrained_layout=True)
-    ax.barh(range(len(feat_ord))[::-1], shap_ord,
-            color=colors, alpha=0.88, edgecolor="none", height=0.65)
-    ax.set_yticks(range(len(feat_ord))[::-1])
-    ax.set_yticklabels(feat_ord, fontsize=9)
-    ax.set_xlabel("Mean |SHAP value|", fontsize=9)
-    label = cfg.label if cfg else model_key
-    ax.set_title(
-        f"SHAP — {exp_tag} | target: {target} | variant: {variant} | {label}\n"
-        f"N={len(df_te):,} obs",
-        fontsize=10, fontweight="bold",
-    )
-    ax.grid(axis="x", lw=0.4, alpha=0.5)
-    ax.spines[["top", "right"]].set_visible(False)
-    ax.legend(handles=[
-        mpatches.Patch(facecolor=C_MODDEP,   label="model-dependent"),
-        mpatches.Patch(facecolor=C_INPUTDEP, label="input-dependent"),
-    ], fontsize=8)
-    if out_dir is not None:
-        _savefig(fig, out_dir / f"shap_{_safe_name(target)}_{variant}.png")
-    plt.show()
-    return fig
-
-
-def plot_shap_crosshead(
-    results_ch: dict,
-    cfg:        ModelConfig,
-    target:     str,
-    out_dir:    Optional[Path] = None,
-    top_n:      int = 15,
-) -> plt.Figure:
-    n_variants = len(results_ch)
-    fig, axes  = plt.subplots(1, n_variants,
-                               figsize=(8 * n_variants, 6), constrained_layout=True)
-    if n_variants == 1:
-        axes = [axes]
-    for ax, (var_name, res) in zip(axes, results_ch.items()):
-        model  = res["model"]
-        feats  = res["feats"]
-        X_test = res["preds"][feats].fillna(0).values
-        explainer = shap.TreeExplainer(model)
-        shap_vals = explainer.shap_values(X_test)
-        mean_shap = np.abs(shap_vals).mean(axis=0)
-        order     = np.argsort(mean_shap)[::-1][:top_n]
-        feat_ord  = [feats[i] for i in order]
-        shap_ord  = mean_shap[order]
-        colors    = [C_MODDEP if f in MODEL_DEP_FEATURES else C_INPUTDEP for f in feat_ord]
-        ax.barh(range(len(feat_ord))[::-1], shap_ord,
-                color=colors, alpha=0.88, edgecolor="none", height=0.65)
-        ax.set_yticks(range(len(feat_ord))[::-1])
-        ax.set_yticklabels(feat_ord, fontsize=9)
-        ax.set_xlabel("Mean |SHAP value|", fontsize=9)
-        m = res["metrics"]
-        ax.set_title(
-            f"Variant: {var_name}\n"
-            f"R²={m['R2']:.4f}  MAE={m['MAE']:.5f}\n"
-            f"lift vs NN={m['lift_nn']:+.1%}",
-            fontsize=9, fontweight="bold",
-        )
-        ax.grid(axis="x", lw=0.4, alpha=0.5)
-        ax.spines[["top", "right"]].set_visible(False)
-        ax.legend(handles=[
-            mpatches.Patch(facecolor=C_MODDEP,   label="model-dependent"),
-            mpatches.Patch(facecolor=C_INPUTDEP, label="input-dependent (aggregated)"),
-        ], fontsize=8, loc="upper left")
-    fig.suptitle(
-        f"Experiment 2 — Cross-Head | {cfg.label}\n"
-        f"SHAP Feature Importance | Target: {target} (median per head)",
-        fontsize=11, fontweight="bold",
-    )
-    if out_dir is not None:
-        _savefig(fig, out_dir / f"shap_crosshead_{_safe_name(target)}.png")
-    plt.show()
-    return fig
-
 
 def run_cross_prompt_experiment(
     df:             pd.DataFrame,
@@ -1060,8 +856,6 @@ def run_cross_prompt_experiment(
             pd.DataFrame(metrics_rows).set_index("variant"),
             out_dir / f"metrics_{_safe_name(target)}.csv",
         )
-        if "oracle" in all_results:
-            plot_top_features(all_results, cfg, target, out_dir=out_dir)
 
     return all_results
 
@@ -1132,7 +926,6 @@ def run_cross_head_experiment(
             pd.DataFrame(metrics_rows).set_index("variant"),
             out_dir / f"metrics_{_safe_name(target)}.csv",
         )
-        plot_shap_crosshead(results_ch, cfg, target, out_dir=out_dir)
 
     return results_ch
 
