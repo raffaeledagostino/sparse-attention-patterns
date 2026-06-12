@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import lightgbm as lgb
-import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import optuna
@@ -18,26 +17,7 @@ from sklearn.metrics import mean_absolute_error, r2_score
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# ── Plot style ────────────────────────────────────────────────────────────────
 
-plt.rcParams.update({
-    "figure.facecolor":   "white",
-    "axes.facecolor":     "white",
-    "axes.edgecolor":     "#333",
-    "axes.linewidth":     0.8,
-    "axes.grid":          True,
-    "grid.color":         "#CCCCCC",
-    "grid.linewidth":     0.5,
-    "xtick.labelsize":    8,
-    "ytick.labelsize":    8,
-    "axes.titlesize":     9,
-    "axes.titleweight":   "bold",
-    "axes.titlepad":      6,
-    "font.family":        "DejaVu Sans",
-})
-
-C_MODDEP   = "#2E86AB"
-C_INPUTDEP = "#E84855"
 
 # ── Save helpers ──────────────────────────────────────────────────────────────
 
@@ -775,19 +755,8 @@ def _run_all_targets(
                 "df_train":   df_train,
                 "best_params": best_params_per_variant.get(var_name),
             }
-            print(f"R²={row['R2']:.4f}  MAE={row['MAE']:.5f}  lift={row['lift']:+.1%}")
-
-    if not rows:
-        return pd.DataFrame(
-            columns=["target", "variant"]
-        ).set_index(["target", "variant"])
-    return (
-        pd.DataFrame(rows)
-        .set_index(["target", "variant"])
-        .sort_index()
-    )
-
-# ── Plot helpers ──────────────────────────────────────────────────────────────
+            if out_dir is not None:
+                print(f"R²={row['R2']:.4f}  MAE={row['MAE']:.5f}  lift={row['lift']:+.1%}")
 
 def run_cross_prompt_experiment(
     df:             pd.DataFrame,
@@ -856,8 +825,8 @@ def run_cross_prompt_experiment(
             pd.DataFrame(metrics_rows).set_index("variant"),
             out_dir / f"metrics_{_safe_name(target)}.csv",
         )
-
-    return all_results
+        if "oracle" in all_results:
+            return all_results
 
 
 def run_cross_head_experiment(
@@ -1317,12 +1286,6 @@ def run_cross_head_raw_experiment(
                 out_dir / f"predictions_{_safe_name(target)}_{var_name}.parquet",
                 index=False,
             )
-            df_shap = _compute_shap_importance(
-                model=model, feats=feats, df_pred=df_pred,
-                target=target, var_name=var_name, exp_tag="cross_head_raw"
-            )
-            if "shap_dfs" not in locals(): shap_dfs = []
-            shap_dfs.append(df_shap)
 
         results_chr[var_name] = {
             "model":       model,
@@ -1338,8 +1301,6 @@ def run_cross_head_raw_experiment(
             pd.DataFrame(metrics_rows).set_index("variant"),
             out_dir / f"metrics_{_safe_name(target)}.csv",
         )
-        if locals().get("shap_dfs"):
-            _save_csv(pd.concat(shap_dfs, ignore_index=True), out_dir / f"shap_{_safe_name(target)}.csv")
 
     return results_chr
 
@@ -1470,12 +1431,6 @@ def run_cross_head_raw_all_targets(
                 df_pred_save["pred"]    = pred
                 df_pred_save["pred_nn"] = pred_nn
                 df_pred_save["resid"]   = y_te - pred
-                df_shap = _compute_shap_importance(
-                    model=model, feats=feats_avail, df_pred=df_pred_save,
-                    target=target, var_name=var_name, exp_tag=exp_tag
-                )
-                if "shap_dfs" not in locals(): shap_dfs = []
-                shap_dfs.append(df_shap)
 
             print(f"R²={r2:.4f}  MAE={mae_model:.5f}  lift_nn={lift_nn:+.1%}")
 
@@ -1490,8 +1445,6 @@ def run_cross_head_raw_all_targets(
     if out_dir_exp is not None and len(df_results):
         out_dir_exp.mkdir(parents=True, exist_ok=True)
         _save_csv(df_results, out_dir_exp / "all_targets_results.csv")
-        if locals().get("shap_dfs"):
-            _save_csv(pd.concat(shap_dfs, ignore_index=True), out_dir_exp / "all_targets_shap.csv")
     return df_results
 
 
