@@ -1164,7 +1164,6 @@ def run_cross_prompt_all_targets(
     if out_dir is not None and len(df_results):
         out_dir.mkdir(parents=True, exist_ok=True)
         _save_csv(df_results, out_dir / "all_targets_results.csv")
-                                   title_suffix="Cross-Prompt", lift_col="lift")
     return df_results
 
 
@@ -1225,7 +1224,6 @@ def run_length_generalization_all_targets(
     if out_dir is not None and len(df_results):
         out_dir.mkdir(parents=True, exist_ok=True)
         _save_csv(df_results, out_dir / "length_generalization_results.csv")
-                                   title_suffix="Length Generalisation", lift_col="lift")
     return df_results
 
 
@@ -1324,7 +1322,6 @@ def run_cross_head_all_targets(
     if out_dir_exp is not None and len(df_results):
         out_dir_exp.mkdir(parents=True, exist_ok=True)
         _save_csv(df_results, out_dir_exp / "all_targets_results.csv")
-                                   title_suffix="Cross-Head", lift_col="lift_nn")
 
     return df_results
 
