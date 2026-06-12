@@ -313,25 +313,7 @@ def length_corrected_head_mean_baseline(
     ).values
     return pred
 
-# ── Hyperparameter tuning (Optuna) ────────────────────────────────────────────
-#
-#
-# Rationale for ranges:
-#   learning_rate  [0.01, 0.15]: avoids too-low lr (slow, no early-stopping gain)
-#                                or too-high lr (underfitting).
-#   num_leaves     [15, 255]:    15 is sufficient for small datasets; 255 allows
-#                                complexity for harder targets.
-#   feature_fraction [0.5, 1.0]: with ~18-20 features, 0.5 gives diversity;
-#                                1.0 uses all features.
-#   bagging_fraction [0.5, 1.0]: same rationale for row subsampling.
-#   min_child_samples [5, 50]:   low bound for cross-head (n~256), upper
-#                                bound 50 for cross-prompt (n>>1000).
-#   lambda_l1      [1e-4, 10]:   L1 regularisation; log range covers near-zero
-#                                to strong penalties.
-#   lambda_l2      [1e-4, 10]:   same rationale for L2.
-#
-# num_boost_round=2000 + early_stopping(60) ensures convergence without
-# fixing a suboptimal num_rounds value.
+
 
 def _lgbm_objective(
     trial:    optuna.Trial,
@@ -466,51 +448,18 @@ def train_lgbm_head(
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
 def _layer_quartile_mae(
-    y_te:        np.ndarray,
-    pred:        np.ndarray,
-    layer_idx:   pd.Series,
-    df_tr:       pd.DataFrame,
-    df_te:       pd.DataFrame,
-    target:      str,
-    baseline_fn: str = "head_mean",
+    y_te:      np.ndarray,
+    pred:      np.ndarray,
+    layer_idx: pd.Series,
 ) -> dict:
-    """
-    Per-quartile MAE (model and baseline) and per-quartile lift.
-
-    Quartiles partition the sorted unique layer indices into four equal-sized
-    groups (Q1 = earliest layers, Q4 = deepest).  For each quartile the
-    function computes:
-      - MAE_Q{q}           : model MAE on that quartile's observations
-      - MAE_baseline_Q{q}  : baseline MAE restricted to the same observations
-      - lift_Q{q}          : (mae_base - mae_model) / (mae_base + 1e-9)
-
-    The baseline is computed independently per quartile so that no cross-
-    quartile information leaks into the per-stratum evaluation.
-    """
-    # Compute full-length baseline predictions (needed for per-row indexing)
-    if baseline_fn == "length_corrected":
-        pred_base_full = length_corrected_head_mean_baseline(df_tr, df_te, target)
-    else:
-        pred_base_full = head_mean_baseline(df_tr, df_te, target)
-
     layers = sorted(layer_idx.unique())
     q_size = max(1, len(layers) // 4)
     l_to_q = {l: min(i // q_size, 3) for i, l in enumerate(layers)}
     q_col  = layer_idx.map(l_to_q).values
-
-    out: dict = {}
-    for q in range(4):
-        mask = q_col == q
-        if mask.sum() == 0:
-            continue
-        mae_model = round(mean_absolute_error(y_te[mask], pred[mask]), 5)
-        mae_base  = round(mean_absolute_error(y_te[mask], pred_base_full[mask]), 5)
-        out[f"MAE_Q{q + 1}"]          = mae_model
-        out[f"MAE_baseline_Q{q + 1}"] = mae_base
-        out[f"lift_Q{q + 1}"]         = round(
-            (mae_base - mae_model) / (mae_base + 1e-9), 4
-        )
-    return out
+    return {
+        f"MAE_Q{q+1}": round(mean_absolute_error(y_te[q_col == q], pred[q_col == q]), 5)
+        for q in range(4) if (q_col == q).sum() > 0
+    }
 
 
 def evaluate(
@@ -689,10 +638,7 @@ def _run_one(
         "lift":         round(lift, 4),
         "best_iter":    model.best_iteration,
     }
-    row.update(_layer_quartile_mae(
-        y_te, pred, df_te["layer_idx"],
-        df_tr=df_tr, df_te=df_te, target=target, baseline_fn=baseline_fn,
-    ))
+    row.update(_layer_quartile_mae(y_te, pred, df_te["layer_idx"]))
 
     if "prompt_source" in df_te.columns:
         for src in sorted(df_te["prompt_source"].unique()):
@@ -771,18 +717,6 @@ def _run_all_targets(
                 "df_train":   df_train,
                 "best_params": best_params_per_variant.get(var_name),
             }
-            # Save SHAP feature-importance plot for this (target, variant) run.
-            if out_dir is not None:
-                _save_shap_plot(
-                    model=model,
-                    feats=feats,
-                    df_pred=df_pred,
-                    target=target,
-                    var_name=var_name,
-                    exp_tag=exp_tag,
-                    cfg=cfg,
-                    out_dir=out_dir,
-                )
             print(f"R²={row['R2']:.4f}  MAE={row['MAE']:.5f}  lift={row['lift']:+.1%}")
 
     if not rows:
@@ -796,53 +730,6 @@ def _run_all_targets(
     )
 
 # ── Plot helpers ──────────────────────────────────────────────────────────────
-
-def _save_shap_plot(
-    model:    lgb.Booster,
-    feats:    List[str],
-    df_pred:  pd.DataFrame,
-    target:   str,
-    var_name: str,
-    exp_tag:  str,
-    cfg:      ModelConfig,
-    out_dir:  Path,
-    top_n:    int = 15,
-) -> None:
-    """
-    Compute mean |SHAP| values on df_pred and save a horizontal bar chart.
-    Called automatically by _run_all_targets for every (target, variant) run
-    when out_dir is provided.
-    """
-    X = df_pred[feats].fillna(0).values
-    explainer = shap.TreeExplainer(model)
-    shap_vals = explainer.shap_values(X)
-    mean_shap = np.abs(shap_vals).mean(axis=0)
-    order     = np.argsort(mean_shap)[::-1][:top_n]
-    feat_ord  = [feats[i] for i in order]
-    shap_ord  = mean_shap[order]
-    colors    = [C_MODDEP if f in MODEL_DEP_FEATURES else C_INPUTDEP
-                 for f in feat_ord]
-
-    fig, ax = plt.subplots(figsize=(7, 5), constrained_layout=True)
-    ax.barh(range(len(feat_ord))[::-1], shap_ord,
-            color=colors, alpha=0.88, edgecolor="none", height=0.65)
-    ax.set_yticks(range(len(feat_ord))[::-1])
-    ax.set_yticklabels(feat_ord, fontsize=9)
-    ax.set_xlabel("Mean |SHAP value|", fontsize=9)
-    ax.set_title(
-        f"SHAP — {exp_tag} | target: {target} | variant: {var_name} | {cfg.label}\n"
-        f"N={len(df_pred):,} obs",
-        fontsize=10, fontweight="bold",
-    )
-    ax.grid(axis="x", lw=0.4, alpha=0.5)
-    ax.spines[["top", "right"]].set_visible(False)
-    ax.legend(handles=[
-        mpatches.Patch(facecolor=C_MODDEP,   label="model-dependent"),
-        mpatches.Patch(facecolor=C_INPUTDEP,  label="input-dependent"),
-    ], fontsize=8)
-    _savefig(fig, out_dir / f"shap_{_safe_name(target)}_{var_name}.png")
-    plt.close(fig)
-
 
 def plot_top_features(
     results_cp: dict,
@@ -990,6 +877,121 @@ def plot_shap_crosshead(
         _savefig(fig, out_dir / f"shap_crosshead_{_safe_name(target)}.png")
     plt.show()
     return fig
+
+
+def plot_r2_vs_lift_panels(
+    pivot:        pd.DataFrame,
+    cfg:          ModelConfig,
+    out_dir:      Optional[Path] = None,
+    title_suffix: str = "Cross-Prompt",
+    lift_col:     str = "lift",         # "lift" | "lift_nn" a seconda dell'exp
+) -> plt.Figure:
+    GROUPS = {
+        "Diagonal targets": {
+            "diagonal_mass_1":         "dm1",
+            "diagonal_mass_1_shifted_1": "dm1_sh1",
+            "diagonal_mass_1_shifted_2": "dm1_sh2",
+            "diagonal_mass_1_shifted_3": "dm1_sh3",
+            "diagonal_mass_1_shifted_4": "dm1_sh4",
+            "diagonal_mass_5":           "dm5",
+        },
+        "Sink targets": {
+            "sink_mass_token_0": "sink_t0",
+            "sink_mass_token_1": "sink_t1",
+            "sink_mass_token_2": "sink_t2",
+            "sink_mass_token_3": "sink_t3",
+            "sink_mass_token_4": "sink_t4",
+            "sink_mass_max":     "sink_max",
+        },
+        "Other targets": {
+            "attention_gini":    "gini",
+            "look_back":         "look_back",
+            "effective_rank_A":  "eff_rank_A",
+            "r95_A":             "r95_A",
+        },
+    }
+    GROUP_COLORS = {
+        "Diagonal targets": ["#1b4f72","#2980b9","#5dade2","#85c1e9","#aed6f1","#d6eaf8"],
+        "Sink targets":     ["#784212","#d35400","#e67e22","#f39c12","#f8c471","#fdebd0"],
+        "Other targets":    ["#E84855","#6A4C93","#3BB273","#1a7a4a"],
+    }
+    off_col = f"{lift_col}_offline"
+    ora_col = f"{lift_col}_oracle"
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5.5), constrained_layout=True)
+    for ax, (group_name, targets_map) in zip(axes, GROUPS.items()):
+        colors = GROUP_COLORS[group_name]
+        ax.axhline(0,    color="#ccc", lw=0.8, ls="--", zorder=0)
+        ax.axvline(0,    color="#ccc", lw=0.8, ls="--", zorder=0)
+        ax.axhspan(0.4, 1.05, color="#e8f5ea", alpha=0.35, zorder=0)
+        ax.text(0.02, 0.42, "lift > 40%", fontsize=7, color="#3a7a45",
+                alpha=0.7, transform=ax.get_xaxis_transform())
+        handles_legend = []
+        for i, (target, label) in enumerate(targets_map.items()):
+            if target not in pivot.index:
+                continue
+            color = colors[i % len(colors)]
+            r2_off   = pivot.loc[target, "R2_offline"]
+            r2_ora   = pivot.loc[target, "R2_oracle"]
+            lift_off = pivot.loc[target, off_col]
+            lift_ora = pivot.loc[target, ora_col]
+            ax.annotate("",
+                xy=(r2_ora, lift_ora), xytext=(r2_off, lift_off),
+                arrowprops=dict(arrowstyle="-|>", color=color, lw=1.2,
+                                mutation_scale=8),
+                zorder=2)
+            ax.scatter(r2_off, lift_off, s=70, facecolors="none",
+                       edgecolors=color, linewidths=1.8, zorder=3)
+            ax.scatter(r2_ora, lift_ora, s=70, color=color,
+                       edgecolors="white", linewidths=0.5, zorder=4)
+            ax.annotate(label, xy=(r2_ora, lift_ora),
+                        xytext=(5, 3), textcoords="offset points",
+                        fontsize=8, color="#222")
+            handles_legend.append(mpatches.Patch(color=color, label=label))
+        ax.set_title(group_name, fontsize=10, fontweight="bold", pad=8)
+        ax.set_xlabel("$R^2$", fontsize=9)
+        if ax is axes[0]:
+            ax.set_ylabel("Lift vs baseline", fontsize=9)
+        ax.set_xlim(-0.20, 1.08)
+        ax.set_ylim(-0.15, 1.05)
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:+.0%}"))
+        ax.grid(lw=0.3, alpha=0.4)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.legend(handles=handles_legend, fontsize=7.5, loc="upper left",
+                  framealpha=0.9, title="target", title_fontsize=7.5)
+    fig.legend(
+        handles=[
+            plt.scatter([], [], s=65, facecolors="none", edgecolors="#555",
+                        linewidths=1.8, label="offline"),
+            plt.scatter([], [], s=65, color="#555", edgecolors="white",
+                        linewidths=0.5, label="oracle"),
+        ],
+        fontsize=8.5, loc="upper center", ncol=2,
+        bbox_to_anchor=(0.5, 1.03),
+        title="○ offline (model-dep only) → ● oracle (+q/k sim)",
+        title_fontsize=8.5, framealpha=0.9,
+    )
+    fig.suptitle(
+        f"Predictability landscape — {title_suffix} | {cfg.label}",
+        fontsize=12, fontweight="bold", y=1.07,
+    )
+    if out_dir is not None:
+        _savefig(fig, out_dir / "r2_vs_lift.png")
+    plt.show()
+    return fig
+
+
+def _build_pivot(df_results: pd.DataFrame, lift_col: str = "lift") -> Optional[pd.DataFrame]:
+    pivot_rows: dict = {}
+    for (tgt, var), row in df_results.iterrows():
+        if tgt not in pivot_rows:
+            pivot_rows[tgt] = {}
+        pivot_rows[tgt][f"R2_{var}"]           = row.get("R2")
+        pivot_rows[tgt][f"{lift_col}_{var}"]   = row.get(lift_col) or row.get("lift")
+    pivot = pd.DataFrame(pivot_rows).T
+    needed = {f"R2_offline", f"R2_oracle",
+              f"{lift_col}_offline", f"{lift_col}_oracle"}
+    return pivot if needed.issubset(pivot.columns) else None
 
 
 def run_cross_prompt_experiment(
@@ -1164,11 +1166,14 @@ def run_cross_prompt_all_targets(
     if out_dir is not None and len(df_results):
         out_dir.mkdir(parents=True, exist_ok=True)
         _save_csv(df_results, out_dir / "all_targets_results.csv")
+        pivot = _build_pivot(df_results, lift_col="lift")
+        if pivot is not None:
+            plot_r2_vs_lift_panels(pivot, cfg, out_dir=out_dir,
                                    title_suffix="Cross-Prompt", lift_col="lift")
     return df_results
 
 
-def run_length_generalization_all_targets(
+def run_length_generalization(
     df:             pd.DataFrame,
     cfg:            ModelConfig,
     targets:        List[str] = ALL_TARGETS,
@@ -1225,6 +1230,9 @@ def run_length_generalization_all_targets(
     if out_dir is not None and len(df_results):
         out_dir.mkdir(parents=True, exist_ok=True)
         _save_csv(df_results, out_dir / "length_generalization_results.csv")
+        pivot = _build_pivot(df_results, lift_col="lift")
+        if pivot is not None:
+            plot_r2_vs_lift_panels(pivot, cfg, out_dir=out_dir,
                                    title_suffix="Length Generalisation", lift_col="lift")
     return df_results
 
@@ -1324,374 +1332,11 @@ def run_cross_head_all_targets(
     if out_dir_exp is not None and len(df_results):
         out_dir_exp.mkdir(parents=True, exist_ok=True)
         _save_csv(df_results, out_dir_exp / "all_targets_results.csv")
+        pivot = _build_pivot(df_results, lift_col="lift_nn")
+        if pivot is not None:
+            plot_r2_vs_lift_panels(pivot, cfg, out_dir=out_dir_exp,
                                    title_suffix="Cross-Head", lift_col="lift_nn")
 
-    return df_results
-
-
-# ── Split helper (raw, by head identity) ─────────────────────────────────────
-
-def split_by_head_raw(
-    df:        pd.DataFrame,
-    val_frac:  float = 0.15,
-    test_frac: float = 0.20,
-    seed:      int   = 42,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    Split the raw (head, prompt) dataset so that entire head identities are
-    held out.  All observations belonging to a given (layer_idx, head_idx)
-    pair land exclusively in one split, preventing any head-level leakage.
-
-    Parameters
-    ----------
-    df        : raw DataFrame with columns layer_idx, head_idx (one row per
-                head × prompt observation)
-    val_frac  : fraction of *heads* (not rows) allocated to validation
-    test_frac : fraction of *heads* allocated to test
-    seed      : RNG seed
-
-    Returns
-    -------
-    df_train, df_val, df_test  (raw rows, no aggregation)
-    """
-    heads = np.array(sorted(df.groupby(["layer_idx", "head_idx"]).groups.keys()))
-    rng   = np.random.default_rng(seed)
-    rng.shuffle(heads)
-    n      = len(heads)
-    n_test = max(1, int(n * test_frac))
-    n_val  = max(1, int(n * val_frac))
-    test_heads  = set(map(tuple, heads[:n_test]))
-    val_heads   = set(map(tuple, heads[n_test:n_test + n_val]))
-    train_heads = set(map(tuple, heads[n_test + n_val:]))
-
-    def _mask(row_heads):
-        return df.apply(
-            lambda r: (r["layer_idx"], r["head_idx"]) in row_heads, axis=1
-        )
-
-    # Vectorised membership check via MultiIndex
-    mi = pd.MultiIndex.from_frame(df[["layer_idx", "head_idx"]])
-    train_mi = pd.MultiIndex.from_tuples(train_heads)
-    val_mi   = pd.MultiIndex.from_tuples(val_heads)
-    test_mi  = pd.MultiIndex.from_tuples(test_heads)
-
-    return (
-        df[mi.isin(train_mi)].copy(),
-        df[mi.isin(val_mi)].copy(),
-        df[mi.isin(test_mi)].copy(),
-    )
-
-
-# ── Nearest-neighbour baseline for raw cross-head-raw setting ─────────────────
-
-def nn_baseline_raw(
-    df_train: pd.DataFrame,
-    df_test:  pd.DataFrame,
-    features: List[str],
-    target:   str,
-) -> np.ndarray:
-    """
-    For each test observation (head_k, prompt_j), find the nearest training
-    HEAD in MODEL_DEP feature space (L2, normalised by train std), then predict
-    the empirical mean of that head's target values in the training set.
-
-    This is the natural NN baseline for the raw cross-head setting: we cannot
-    use per-prompt head means (head_k was never seen), so we fall back to the
-    closest known head's average behaviour.
-    """
-    md_cols = [c for c in features if c in MODEL_DEP_FEATURES and c in df_train.columns]
-    if not md_cols:
-        return np.full(len(df_test), df_train[target].mean())
-
-    # Build per-head representative vector (mean of MODEL_DEP features across
-    # prompts — they should be constant per head, but mean is robust to NaNs)
-    head_rep_tr = (
-        df_train.groupby(["layer_idx", "head_idx"])[md_cols]
-        .mean()
-        .reset_index()
-    )
-    head_mean_tr = (
-        df_train.groupby(["layer_idx", "head_idx"])[target]
-        .mean()
-        .reset_index()
-        .rename(columns={target: "__head_mean__"})
-    )
-    head_tr = head_rep_tr.merge(head_mean_tr, on=["layer_idx", "head_idx"])
-
-    X_tr = head_tr[md_cols].fillna(0).values
-    mu    = X_tr.mean(axis=0)
-    sigma = X_tr.std(axis=0) + 1e-8
-    X_tr_n = (X_tr - mu) / sigma
-
-    # For test rows, use the MODEL_DEP features directly (constant per head)
-    X_te = df_test[md_cols].fillna(0).values
-    X_te_n = (X_te - mu) / sigma
-
-    nn_idx = np.array([
-        np.argmin(np.linalg.norm(X_tr_n - x, axis=1))
-        for x in X_te_n
-    ])
-    return head_tr["__head_mean__"].iloc[nn_idx].values
-
-
-# ── Cross-head-raw: single target, interactive ────────────────────────────────
-
-def run_cross_head_raw_experiment(
-    df:            pd.DataFrame,
-    cfg:           ModelConfig,
-    target:        Optional[str] = None,
-    tune:          bool  = True,
-    n_trials:      int   = 10,
-    seed:          int   = 42,
-    out_dir:       Optional[Path] = None,
-) -> dict:
-    """
-    Cross-head generalisation on the *raw* (head, prompt) dataset.
-
-    Entire head identities are held out at test time: the model is trained on
-    all observations from train_heads and evaluated on all observations from
-    unseen test_heads.  No aggregation is performed — the full per-prompt
-    signal is preserved.
-
-    Baseline: nn_baseline_raw — nearest training head by MODEL_DEP features,
-    predicting that head's empirical mean target.
-
-    Use run_cross_head_raw_all_targets() for batch evaluation over ALL_TARGETS.
-    """
-    target  = target or cfg.default_target
-    out_dir = Path(out_dir) / cfg.key / "cross_head_raw" if out_dir else None
-
-    df_train, df_val, df_test = split_by_head_raw(df, seed=seed)
-
-    n_train_heads = df_train.groupby(["layer_idx", "head_idx"]).ngroups
-    n_val_heads   = df_val.groupby(["layer_idx", "head_idx"]).ngroups
-    n_test_heads  = df_test.groupby(["layer_idx", "head_idx"]).ngroups
-
-    print(f"\n{'═'*62}")
-    print(f" {cfg.label} — Cross-Head Raw [target: {target}]")
-    print(f"{'═'*62}")
-    print(f" Heads  — train: {n_train_heads} | val: {n_val_heads} | test: {n_test_heads}")
-    print(f" Rows   — train: {len(df_train):,} | val: {len(df_val):,} | test: {len(df_test):,}")
-
-    results_chr: dict = {}
-    metrics_rows: list = []
-
-    for var_name, features in FEATURE_SETS.items():
-        feats = [f for f in features if f in df.columns]
-        print(f"\n ── {var_name} ({len(feats)} features) ──")
-
-        best_params = None
-        if tune:
-            print(f"  Optuna tuning ({n_trials} trials)...", end=" ", flush=True)
-            best_params = tune_lgbm(df_train, df_val, feats, target, n_trials, seed)
-            print("done.")
-
-        model   = train_lgbm(df_train, df_val, feats, target,
-                             params_override=best_params, seed=seed)
-        y_te    = df_test[target].values
-        pred    = model.predict(df_test[feats].values)
-        pred_nn = nn_baseline_raw(df_train, df_test, feats, target)
-
-        mae_model = mean_absolute_error(y_te, pred)
-        mae_nn    = mean_absolute_error(y_te, pred_nn)
-        r2        = r2_score(y_te, pred)
-        lift_nn   = (mae_nn - mae_model) / (mae_nn + 1e-9)
-
-        metrics: dict = {
-            "R2":           round(r2, 4),
-            "MAE":          round(mae_model, 5),
-            "MAE_nn":       round(mae_nn, 5),
-            "lift_nn":      round(lift_nn, 4),
-            "n_test_heads": n_test_heads,
-            "n_test_rows":  len(y_te),
-        }
-        if "prompt_source" in df_test.columns:
-            for src_name in sorted(df_test["prompt_source"].unique()):
-                mask  = (df_test["prompt_source"] == src_name).values
-                short = src_name.split("_")[0]
-                if mask.sum() > 0:
-                    metrics[f"MAE_{short}"]    = round(mean_absolute_error(y_te[mask], pred[mask]), 5)
-                    metrics[f"MAE_nn_{short}"] = round(mean_absolute_error(y_te[mask], pred_nn[mask]), 5)
-
-        print(f"  R²: {r2:.4f}  MAE: {mae_model:.5f}  MAE_nn: {mae_nn:.5f}"
-              f"  lift_vs_NN: {lift_nn:+.1%}")
-
-        df_pred = df_test.copy()
-        df_pred["pred"]    = pred
-        df_pred["pred_nn"] = pred_nn
-        df_pred["resid"]   = y_te - pred
-
-        if out_dir is not None:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            df_pred.to_parquet(
-                out_dir / f"predictions_{_safe_name(target)}_{var_name}.parquet",
-                index=False,
-            )
-            _save_shap_plot(
-                model=model, feats=feats, df_pred=df_pred,
-                target=target, var_name=var_name,
-                exp_tag="cross_head_raw", cfg=cfg, out_dir=out_dir,
-            )
-
-        results_chr[var_name] = {
-            "model":       model,
-            "feats":       feats,
-            "metrics":     metrics,
-            "df_pred":     df_pred,
-            "best_params": best_params,
-        }
-        metrics_rows.append({"variant": var_name, **metrics})
-
-    if out_dir is not None:
-        _save_csv(
-            pd.DataFrame(metrics_rows).set_index("variant"),
-            out_dir / f"metrics_{_safe_name(target)}.csv",
-        )
-
-    return results_chr
-
-
-# ── Cross-head-raw: all targets ───────────────────────────────────────────────
-
-def run_cross_head_raw_all_targets(
-    df:       pd.DataFrame,
-    cfg:      ModelConfig,
-    targets:  List[str] = ALL_TARGETS,
-    tune:     bool  = True,
-    n_trials: int   = 10,
-    seed:     int   = 42,
-    out_dir:  Optional[Path] = None,
-) -> pd.DataFrame:
-    """
-    Batch version of run_cross_head_raw_experiment over every target in
-    `targets`.
-
-    The head-based split is computed once per target (same seed → same
-    partition).  For each (target, variant) pair the function trains a
-    LightGBM on all raw observations from train_heads and evaluates on
-    held-out test_heads, reporting MAE, R², and lift vs the NN baseline.
-
-    Results are saved to <out_dir>/<model_key>/cross_head_raw/.
-    Use run_cross_head_raw_experiment() for interactive single-target runs.
-    """
-    exp_tag     = "cross_head_raw"
-    out_dir_exp = Path(out_dir) / cfg.key / "cross_head_raw" if out_dir else None
-
-    print(f"\n{'═'*62}")
-    print(f" {cfg.label} — Cross-Head Raw (all targets)")
-    print(f"{'═'*62}\n")
-
-    rows: list = []
-    valid_targets = [t for t in targets if t in df.columns]
-    total = len(valid_targets) * len(FEATURE_SETS)
-    done  = 0
-
-    # Single split shared across all targets (consistent head partition)
-    df_train, df_val, df_test = split_by_head_raw(df, seed=seed)
-    n_train_heads = df_train.groupby(["layer_idx", "head_idx"]).ngroups
-    n_test_heads  = df_test.groupby(["layer_idx", "head_idx"]).ngroups
-    print(f" Head split — train: {n_train_heads} | test: {n_test_heads}")
-    print(f" Row  split — train: {len(df_train):,} | val: {len(df_val):,}"
-          f" | test: {len(df_test):,}\n")
-
-    for target in valid_targets:
-        best_params_per_variant: Dict[str, Optional[dict]] = {v: None for v in FEATURE_SETS}
-
-        if tune:
-            for var_name, features in FEATURE_SETS.items():
-                feats_avail = [f for f in features if f in df.columns]
-                df_tr_clean = df_train.dropna(subset=[target])
-                df_va_clean = df_val.dropna(subset=[target])
-                if len(df_tr_clean) < 50:
-                    continue
-                print(f"  Optuna [CHR/{var_name}] {target} ({n_trials} trials)...",
-                      end=" ", flush=True)
-                best_params_per_variant[var_name] = tune_lgbm(
-                    df_tr_clean, df_va_clean, feats_avail, target, n_trials, seed)
-                print("done.")
-
-            if out_dir_exp is not None:
-                import json
-                params_path = out_dir_exp / f"best_params_{_safe_name(target)}.json"
-                params_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(params_path, "w") as fp:
-                    json.dump(best_params_per_variant, fp, indent=2)
-
-        for var_name, features in FEATURE_SETS.items():
-            done += 1
-            feats_avail = [f for f in features if f in df.columns]
-            print(f"[{done:>3}/{total}] {target:<38} {var_name}", end=" ")
-
-            df_tr = df_train.dropna(subset=[target])
-            df_va = df_val.dropna(subset=[target])
-            df_te = df_test.dropna(subset=[target])
-            if len(df_tr) < 50 or len(df_te) < 10:
-                print("SKIP"); continue
-
-            model   = train_lgbm(df_tr, df_va, feats_avail, target,
-                                 params_override=best_params_per_variant.get(var_name),
-                                 seed=seed)
-            y_te    = df_te[target].values
-            pred    = model.predict(df_te[feats_avail].values)
-            pred_nn = nn_baseline_raw(df_tr, df_te, feats_avail, target)
-
-            mae_model = mean_absolute_error(y_te, pred)
-            mae_nn    = mean_absolute_error(y_te, pred_nn)
-            r2        = r2_score(y_te, pred)
-            lift_nn   = (mae_nn - mae_model) / (mae_nn + 1e-9)
-
-            row: dict = {
-                "target":        target,
-                "variant":       var_name,
-                "R2":            round(r2, 4),
-                "MAE":           round(mae_model, 5),
-                "MAE_nn":        round(mae_nn, 5),
-                "lift_nn":       round(lift_nn, 4),
-                "n_test_heads":  n_test_heads,
-                "best_iter":     model.best_iteration,
-            }
-            if "prompt_source" in df_te.columns:
-                for src_name in sorted(df_te["prompt_source"].unique()):
-                    mask  = (df_te["prompt_source"] == src_name).values
-                    short = src_name.split("_")[0]
-                    if mask.sum() > 0:
-                        row[f"MAE_{short}"] = round(
-                            mean_absolute_error(y_te[mask], pred[mask]), 5)
-
-            rows.append(row)
-            _RUN_CACHE[(exp_tag, cfg.key, target, var_name)] = {
-                "model":      model,
-                "feats":      feats_avail,
-                "df_pred":    df_te.assign(pred=pred, pred_nn=pred_nn,
-                                           resid=y_te - pred),
-                "df_train":   df_tr,
-                "best_params": best_params_per_variant.get(var_name),
-            }
-
-            if out_dir_exp is not None:
-                df_pred_save = df_te.copy()
-                df_pred_save["pred"]    = pred
-                df_pred_save["pred_nn"] = pred_nn
-                df_pred_save["resid"]   = y_te - pred
-                _save_shap_plot(
-                    model=model, feats=feats_avail, df_pred=df_pred_save,
-                    target=target, var_name=var_name,
-                    exp_tag=exp_tag, cfg=cfg, out_dir=out_dir_exp,
-                )
-
-            print(f"R²={r2:.4f}  MAE={mae_model:.5f}  lift_nn={lift_nn:+.1%}")
-
-    if not rows:
-        return pd.DataFrame(columns=["target", "variant"]).set_index(["target", "variant"])
-
-    df_results = (
-        pd.DataFrame(rows)
-        .set_index(["target", "variant"])
-        .sort_index()
-    )
-    if out_dir_exp is not None and len(df_results):
-        out_dir_exp.mkdir(parents=True, exist_ok=True)
-        _save_csv(df_results, out_dir_exp / "all_targets_results.csv")
     return df_results
 
 
@@ -1699,7 +1344,7 @@ def run_all_models(
     datasets:    Dict[str, pd.DataFrame],
     model_cfgs:  List[ModelConfig],
     experiments: List[str] = ["cross_prompt", "cross_head",
-                               "cross_head_raw", "length_generalization"],
+                               "length_generalization"],
     tune:        bool  = True,
     n_trials:    int   = 3,
     seed:        int   = 42,
@@ -1715,8 +1360,8 @@ def run_all_models(
                    multiple lengths (column prompt_len).
     model_cfgs   : list of ModelConfig
     experiments  : subset of
-                   ["cross_prompt", "cross_head",
-                    "cross_head_raw", "length_generalization"]
+                   ["cross_prompt", "cross_head", "all_targets",
+                    "length_generalization"]
                    Default: all four.
     tune         : enable Optuna (True recommended)
     n_trials     : Optuna trials per variant × target
@@ -1752,13 +1397,9 @@ def run_all_models(
                 df, cfg, tune=tune, n_trials=n_trials, seed=seed, out_dir=out_dir,
             )
 
-        if "cross_head_raw" in experiments:
-            model_results["cross_head_raw"] = run_cross_head_raw_all_targets(
-                df, cfg, tune=tune, n_trials=n_trials, seed=seed, out_dir=out_dir,
-            )
 
         if "length_generalization" in experiments:
-            model_results["length_generalization"] = run_length_generalization_all_targets(
+            model_results["length_generalization"] = run_length_generalization(
                 df, cfg, tune=tune, n_trials=n_trials, seed=seed, out_dir=out_dir,
             )
 
