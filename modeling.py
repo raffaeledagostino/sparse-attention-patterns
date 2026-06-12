@@ -705,7 +705,7 @@ def _run_all_targets(
             if out_dir is not None:
                 _save_shap_plot(
                     model=model, feats=feats, df_pred=df_pred,
-                    target=target, var_name=var_name,
+                    target=target, var_name=var_name, max_shap_rows=500,
                     exp_tag=exp_tag, cfg=cfg, out_dir=out_dir,
                 )
 
@@ -722,17 +722,26 @@ def _run_all_targets(
 # ── Plot helpers ──────────────────────────────────────────────────────────────
 
 def _save_shap_plot(
-    model:    lgb.Booster,
-    feats:    List[str],
-    df_pred:  pd.DataFrame,
-    target:   str,
-    var_name: str,
-    exp_tag:  str,
-    cfg:      ModelConfig,
-    out_dir:  Path,
-    top_n:    int = 15,
+    model:         lgb.Booster,
+    feats:         List[str],
+    df_pred:       pd.DataFrame,
+    target:        str,
+    var_name:      str,
+    exp_tag:       str,
+    cfg:           ModelConfig,
+    out_dir:       Path,
+    top_n:         int = 15,
+    max_shap_rows: int = 500,        
 ) -> None:
-    X         = df_pred[feats].fillna(0).values
+    n = len(df_pred)
+    if n > max_shap_rows:
+        rng    = np.random.default_rng(42)
+        idx    = rng.choice(n, size=max_shap_rows, replace=False)
+        X      = df_pred[feats].fillna(0).iloc[idx].values
+        n_shap = max_shap_rows
+    else:
+        X      = df_pred[feats].fillna(0).values
+        n_shap = n
     explainer = shap.TreeExplainer(model)
     shap_vals = explainer.shap_values(X)
     mean_shap = np.abs(shap_vals).mean(axis=0)
@@ -748,8 +757,7 @@ def _save_shap_plot(
     ax.set_yticklabels(feat_ord, fontsize=9)
     ax.set_xlabel("Mean |SHAP value|", fontsize=9)
     ax.set_title(
-        f"SHAP — {exp_tag} | target: {target} | variant: {var_name} | {cfg.label}\n"
-        f"N={len(df_pred):,} obs",
+        f"SHAP — {exp_tag} | target: {target} | variant: {var_name} | {cfg.label}\n",
         fontsize=10, fontweight="bold",
     )
     ax.grid(axis="x", lw=0.4, alpha=0.5)
@@ -1503,7 +1511,7 @@ def run_cross_head_raw_experiment(
             )
             _save_shap_plot(
                 model=model, feats=feats, df_pred=df_pred,
-                target=target, var_name=var_name,
+                target=target, var_name=var_name, max_shap_rows=500,
                 exp_tag="cross_head_raw", cfg=cfg, out_dir=out_dir,
             )
 
@@ -1643,7 +1651,7 @@ def run_cross_head_raw_all_targets(
                 df_pred_save["resid"]   = y_te - pred
                 _save_shap_plot(
                     model=model, feats=feats_avail, df_pred=df_pred_save,
-                    target=target, var_name=var_name,
+                    target=target, var_name=var_name, max_shap_rows=500,
                     exp_tag=exp_tag, cfg=cfg, out_dir=out_dir_exp,
                 )
 
