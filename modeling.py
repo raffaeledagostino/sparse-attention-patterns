@@ -1331,39 +1331,36 @@ from pathlib import Path
 
 
 
+import json
+import shap
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from pathlib import Path
+from typing import Dict, List, Optional, Union
+
+# --- Assicurati di aver importato dal tuo modeling.py: ---
+# from modeling import (FEATURESETS, MODELDEP_FEATURES, CMODDEP, CINPUTDEP, 
+#                       split_by_prompt, split_by_head_raw, train_lgbm, safe_name)
+
 def plot_shap(
     dataset: pd.DataFrame,
     targets_list: List[str],
-    opt_params_file: str | Path,
-    cfg: ModelConfig,
+    opt_params_file: Union[str, Path],
+    cfg, # ModelConfig
     setting: str = "cross_prompt",
-    variant: str = "oracle",  # <-- Parametro aggiunto per scegliere "oracle" o "offline"
-    outdir: str | Path = "shap_plots",
+    variant: str = "oracle",
+    outdir: Union[str, Path] = "shap_plots",
     top_n: int = 15,
     seed: int = 42
 ) -> None:
-    """
-    Computes SHAP feature importance for one or more targets using pre-tuned hyperparameters
-    and saves the plot. Does not perform Optuna tuning.
     
-    Args:
-        dataset: The DataFrame containing features and targets.
-        targets_list: List of target column names to compute SHAP for.
-        opt_params_file: Path to the JSON file containing optimal hyperparameters.
-        cfg: ModelConfig instance for the current model.
-        setting: "cross_prompt" (default) or "cross_head".
-        variant: Which feature set to use, e.g., "oracle" or "offline".
-        outdir: Directory to save the plots.
-        top_n: Number of top features to show in the plot.
-        seed: Random seed for data splitting.
-    """
-    if variant not in FEATURE_SETS:
-        raise ValueError(f"Variant '{variant}' not found in FEATURE_SETS. Choose from: {list(FEATURE_SETS.keys())}")
-
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     
-    # Carica i best_params dal file JSON pre-calcolato
+    # Carica il JSON. Questo JSON contiene chiavi "offline" e "oracle"
     with open(opt_params_file, 'r') as f:
         best_params_all = json.load(f)
         
@@ -1375,17 +1372,17 @@ def plot_shap(
         print(f"Running SHAP for {target} ({setting} - {variant})...")
         
         # Seleziona le feature in base alla variante
-        features = FEATURE_SETS[variant]
+        features = FEATURESETS[variant]
         feats_avail = [f for f in features if f in dataset.columns]
         
-        # Estrai hyperparameters
+        # Estrai hyperparameters proprio per la variante ("offline" o "oracle")
         if isinstance(best_params_all, dict) and variant in best_params_all:
             best_params = best_params_all[variant]
         else:
             print(f"  Warning: No optimal params found for variant '{variant}'. Using default parameters.")
             best_params = None
 
-        # Fai lo split usando le funzioni esistenti
+        # Split data
         if setting == "cross_head":
             dftr, dfva, dfte = split_by_head_raw(dataset, seed=seed)
         else:  # cross_prompt
@@ -1399,13 +1396,13 @@ def plot_shap(
             print(f"  Skipping {target}: insufficient data after dropping NaNs.")
             continue
             
-        # SUBSAMPLING per SHAP per evitare il bottleneck su test set enormi
+        # SUBSAMPLING per SHAP
         if len(dfte_clean) > 5000:
             dfte_shap = dfte_clean.sample(5000, random_state=seed)
         else:
             dfte_shap = dfte_clean
             
-        # Training (Fast, using early stopping with valid_set)
+        # Training (Fast)
         model = train_lgbm(
             dftr_clean, dfva_clean, feats_avail, target, 
             params_override=best_params, seed=seed
@@ -1422,7 +1419,7 @@ def plot_shap(
         feat_ord = [feats_avail[i] for i in order]
         shap_ord = mean_shap[order]
         
-        colors = [C_MODDEP if f in MODEL_DEP_FEATURES else C_INPUTDEP for f in feat_ord]
+        colors = [CMODDEP if f in MODELDEP_FEATURES else CINPUTDEP for f in feat_ord]
         
         # Plot
         fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
@@ -1431,23 +1428,23 @@ def plot_shap(
         ax.set_yticklabels(feat_ord, fontsize=9)
         ax.set_xlabel('Mean |SHAP| value', fontsize=9)
         
-        # Titolo aggiornato con la variante
         ax.set_title(f"SHAP Feature Importance ({setting} - {variant})\nTarget: {target} | Model: {cfg.label}", fontsize=11, fontweight='bold')
         ax.grid(axis='x', lw=0.4, alpha=0.5)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         
         ax.legend(handles=[
-            mpatches.Patch(facecolor=C_MODDEP, label='model-dependent'),
-            mpatches.Patch(facecolor=C_INPUTDEP, label='input-dependent')
+            mpatches.Patch(facecolor=CMODDEP, label='model-dependent'),
+            mpatches.Patch(facecolor=CINPUTDEP, label='input-dependent')
         ], fontsize=8, loc='lower right')
         
-        # Salva file con il nome della variante
         safe_target = target.replace('/', '_').replace(' ', '_').replace('-', '_')
         filepath = outdir / f"shap_{setting}_{variant}_{safe_target}.png"
         fig.savefig(filepath, dpi=150, bbox_inches='tight')
         plt.close(fig)
         print(f"  ✓ Saved plot to {filepath}")
+
+
 
 
 
