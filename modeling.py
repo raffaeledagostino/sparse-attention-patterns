@@ -16,6 +16,12 @@ import pandas as pd
 import shap
 from sklearn.metrics import mean_absolute_error, r2_score
 
+
+import json
+import shap
+from pathlib import Path
+from typing import Dict, List, Optional, Union
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -480,7 +486,7 @@ def evaluate(
     df_test:  pd.DataFrame,
     features: List[str],
     target:   str,
-    cfg:      "ModelConfig",  # Assicurati di importare/gestire questa type hint
+    cfg:      "ModelConfig",  
     df_train: Optional[pd.DataFrame] = None,
     baseline_fn: str = "head_mean",
 ) -> Tuple[dict, pd.DataFrame]:
@@ -490,7 +496,6 @@ def evaluate(
     X_te = df_test[features].values
     y_te = df_test[target].values
     
-    # Assicurati che le prediction siano un array 1D
     pred = model.predict(X_te)
     if pred.ndim > 1:
         pred = pred.squeeze()
@@ -508,10 +513,8 @@ def evaluate(
             
         results["MAE_baseline"]    = mean_absolute_error(y_te, pred_base)
         results["MAE_improvement"] = results["MAE_baseline"] - results["MAE"]
-        # Evitare divisioni per zero se baseline è perfetta (improbabile, ma best practice)
         results["lift"]            = results["MAE_improvement"] / (results["MAE_baseline"] + 1e-9)
 
-    # Computa MAE diviso per sorgente del prompt
     if "prompt_source" in df_test.columns:
         for src in df_test["prompt_source"].unique():
             mask  = (df_test["prompt_source"] == src).values
@@ -563,7 +566,6 @@ def evaluate_head(
     df_out["resid"] = y_te - pred
     return out, df_out
 
-# ── Aggregation (cross-head) ──────────────────────────────────────────────────
 
 def aggregate_per_head(
     df:       pd.DataFrame,
@@ -889,8 +891,6 @@ def plot_shap_crosshead(
         _savefig(fig, out_dir / f"shap_crosshead_{_safe_name(target)}.png")
     plt.show()
     return fig
-
-
 
 
 
@@ -1325,25 +1325,6 @@ def run_cross_head_all_targets(
     return df_results
 
 
-import json
-import shap
-from pathlib import Path
-
-
-
-import json
-import shap
-import numpy as np
-import pandas as pd
-import lightgbm as lgb
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from pathlib import Path
-from typing import Dict, List, Optional, Union
-
-# --- Assicurati di aver importato dal tuo modeling.py: ---
-# from modeling import (FEATURESETS, MODELDEP_FEATURES, CMODDEP, CINPUTDEP, 
-#                       split_by_prompt, split_by_head_raw, train_lgbm, safe_name)
 
 def plot_shap(
     dataset: pd.DataFrame,
@@ -1360,7 +1341,6 @@ def plot_shap(
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     
-    # Carica il JSON. Questo JSON contiene chiavi "offline" e "oracle"
     with open(opt_params_file, 'r') as f:
         best_params_all = json.load(f)
         
@@ -1372,7 +1352,7 @@ def plot_shap(
         print(f"Running SHAP for {target} ({setting} - {variant})...")
         
         # Seleziona le feature in base alla variante
-        features = FEATURESETS[variant]
+        features = FEATURE_SETS[variant]
         feats_avail = [f for f in features if f in dataset.columns]
         
         # Estrai hyperparameters proprio per la variante ("offline" o "oracle")
@@ -1419,7 +1399,7 @@ def plot_shap(
         feat_ord = [feats_avail[i] for i in order]
         shap_ord = mean_shap[order]
         
-        colors = [CMODDEP if f in MODELDEP_FEATURES else CINPUTDEP for f in feat_ord]
+        colors = [C_MODDEP if f in MODEL_DEP_FEATURES else C_INPUTDEP for f in feat_ord]
         
         # Plot
         fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
@@ -1434,8 +1414,8 @@ def plot_shap(
         ax.spines['right'].set_visible(False)
         
         ax.legend(handles=[
-            mpatches.Patch(facecolor=CMODDEP, label='model-dependent'),
-            mpatches.Patch(facecolor=CINPUTDEP, label='input-dependent')
+            mpatches.Patch(facecolor=C_MODDEP, label='model-dependent'),
+            mpatches.Patch(facecolor=C_INPUTDEP, label='input-dependent')
         ], fontsize=8, loc='lower right')
         
         safe_target = target.replace('/', '_').replace(' ', '_').replace('-', '_')
