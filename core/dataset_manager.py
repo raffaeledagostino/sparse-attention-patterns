@@ -101,14 +101,12 @@ def append_records(self, records: List[Dict[str, Any]]) -> int:
     if missing_keys:
         raise ValueError(f"Records missing primary key columns: {missing_keys}")
 
-    # --- Case 1: no existing dataset ---
     existing_df = self.read_dataset()
     if existing_df is None:
         combined_df = df_new
         print(f"[DatasetManager] Creating new dataset: {len(df_new)} rows, {len(df_new.columns)} cols.")
 
     else:
-        # Build key sets for comparison
         def _key_set(df: pd.DataFrame):
             return set(zip(*[df[k].astype(str) for k in PRIMARY_KEYS]))
 
@@ -120,25 +118,21 @@ def append_records(self, records: List[Dict[str, Any]]) -> int:
 
         combined_df = existing_df.copy()
 
-        # --- Case 2: append genuinely new rows ---
         if truly_new:
             mask = df_new.apply(
                 lambda r: tuple(str(r[k]) for k in PRIMARY_KEYS) in truly_new,
                 axis=1
             )
             df_append = df_new[mask].copy()
-            # Fill missing columns from existing schema with NaN
             for col in existing_df.columns:
                 if col not in df_append.columns:
                     df_append[col] = np.nan
             combined_df = pd.concat([combined_df, df_append], ignore_index=True)
             print(f"[DatasetManager] Appended {len(df_append)} new rows.")
 
-        # --- Case 3: new feature columns for existing rows ---
         new_feature_cols = [c for c in df_new.columns if c not in existing_df.columns]
         if new_feature_cols and overlap:
             cols_to_merge = PRIMARY_KEYS + new_feature_cols
-            # Cast keys to str for merge safety
             merge_right = df_new[cols_to_merge].copy()
             for k in PRIMARY_KEYS:
                 combined_df[k] = combined_df[k].astype(str)
@@ -150,7 +144,6 @@ def append_records(self, records: List[Dict[str, Any]]) -> int:
             print("[DatasetManager] Warning: no new rows and no new columns detected. Nothing written.")
             return len(combined_df)
 
-    # Write atomically
     try:
         self.filepath.parent.mkdir(parents=True, exist_ok=True)
         if self.format == "parquet":

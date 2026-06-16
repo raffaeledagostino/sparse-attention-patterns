@@ -155,7 +155,7 @@ class LightweightAttentionAnalyzer:
         else:
             return "cpu"
     
-    def analyze_prompt(self, prompt, max_length=128, layer_indices=None,
+    def analyze_prompt(self, prompt, max_length=512, layer_indices=None,
                    head_indices=None, prompt_source="unknown"):
 
         tokens = self.tokenizer(prompt, return_tensors="pt", padding=True,
@@ -248,9 +248,7 @@ class LightweightAttentionAnalyzer:
                 W_k_heads_cpu = W_k_cpu.reshape(num_kv_heads, head_dim, -1)
                 W_v_heads_cpu = W_v_cpu.reshape(num_kv_heads, head_dim, -1)
 
-                # ------------------------------------------------------------------
-                # Q/K projection + optional QK-Norm (on model device, then to CPU)
-                # ------------------------------------------------------------------
+               
                 Q_raw = H_input @ W_q.T
                 if hasattr(attention_module, "q_proj") and attention_module.q_proj.bias is not None:
                     Q_raw = Q_raw + attention_module.q_proj.bias.to(H_input.device)

@@ -511,7 +511,8 @@ def _plot_feature(feat, feat_bounds, meta, df, model_cfg):
                 color=QUARTILE_COLORS[:len(q_vals)],
                 label=QUARTILE_LABELS[:len(q_vals)],
                 alpha=0.85, density=use_density, edgecolor="none")
-        ax.legend(title="Layer depth", title_fontsize=7, loc="upper right", fontsize=7)
+        loc_str = "upper left" if ("rank" in feat.lower() or "q_sim" in feat.lower() or "k_sim" in feat.lower() or "r95" in feat.lower() or "gini" in feat.lower() or 'look' in feat.lower()) else "upper right"
+        ax.legend(title="Layer depth", title_fontsize=7, loc=loc_str, fontsize=7)
         split_tag = "[layer quartiles]"
 
     # ── Branch B: per-dataset split histogram (input_dependent / target) ─────
@@ -533,8 +534,9 @@ def _plot_feature(feat, feat_bounds, meta, df, model_cfg):
                 ax.axvline(np.mean(vc),   color=palette[key], lw=1.4, ls="-")
                 ax.axvline(np.median(vc), color=palette[key], lw=1.4, ls="--")
 
+        loc_str = "upper left" if ("rank" in feat.lower() or "q_sim" in feat.lower() or "k_sim" in feat.lower() or "r95" in feat.lower() or "gini" in feat.lower() or 'look' in feat.lower()) else "upper right"
         ax.legend(title="— mean   -- median",
-                  title_fontsize=7, loc="upper right", fontsize=7)
+                  title_fontsize=7, loc=loc_str, fontsize=7)
         split_tag = "[wiki vs fineweb]" if meta["show_split"] else "[model only]"
 
     ax.set_xlim(lo_p, hi_p)
