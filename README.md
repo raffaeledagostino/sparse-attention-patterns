@@ -29,7 +29,7 @@ Models and device support
 
 EDA and target prediction
 - The `eda.py` script and notebooks show feature distributions, correlations, and basic visualizations.
-- A target-feature prediction task (notebook `model_testing.ipynb`) demonstrates training a simple regressor/classifier on the extracted features to predict a chosen target metric.
+- A target-feature prediction task (notebook `lightGBM_opt&fitting.ipynb`) demonstrates training a simple regressor/classifier on the extracted features to predict a chosen target metric.
 
 
 Notes & best practices
